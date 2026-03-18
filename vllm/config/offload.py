@@ -94,6 +94,27 @@ class OffloadConfig:
     prefetch: PrefetchOffloadConfig = Field(default_factory=PrefetchOffloadConfig)
     """Parameters for prefetch offloading backend."""
 
+    moe_expert_cache_size: int = Field(default=0, ge=0)
+    """Number of MoE expert weight rows to keep in a GPU cache buffer. When
+    greater than zero, all expert weights are stored in CPU pinned memory and
+    only the N most-frequently/recently-used experts (depending on the policy)
+    are mirrored into a fixed-size GPU scratch buffer. On each forward pass,
+    missing experts are copied from CPU to GPU (H2D) and entries are evicted
+    according to the configured policy. Default is 0 (disabled; all experts
+    remain on GPU). Not compatible with CUDA graph capture — use
+    ``--enforce-eager`` when setting this option. Not compatible with expert
+    parallelism (EP > 1).
+    """
+
+    moe_expert_cache_policy: Literal["lru", "lfu", "fifo", "slru"] = "lru"
+    """Cache eviction policy for MoE expert weights. Options:
+    - "lru": Least Recently Used (default, best for temporal locality)
+    - "lfu": Least Frequently Used (best for skewed access patterns)
+    - "fifo": First In First Out (simple, predictable eviction order)
+    - "slru": Segmented LRU (two-tier cache, best for mixed workloads)
+    Only used when moe_expert_cache_size > 0.
+    """
+
     @model_validator(mode="after")
     def validate_offload_config(self) -> "OffloadConfig":
         """Validate offload configuration constraints."""
