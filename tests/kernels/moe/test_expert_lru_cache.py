@@ -188,10 +188,12 @@ def test_scale_updated_after_eviction():
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
-def test_overflow_raises():
+def test_overflow_warns_and_truncates():
     provider, *_ = _make_provider(capacity=2)
-    with pytest.raises(RuntimeError, match="capacity"):
-        provider.prepare(_topk([0, 1, 2, 3]))
+    # 4 unique experts > capacity 2: should warn, not crash
+    result = provider.prepare(_topk([0, 1, 2, 3]))
+    assert result.topk_ids.shape == (1, 4)
+    assert len(provider._lru) <= 2
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")

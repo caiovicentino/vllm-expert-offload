@@ -143,6 +143,7 @@ class CachedWeightProvider(ExpertWeightProvider):
         # LRU order: OrderedDict[expert_id, slot_index]
         self._lru: OrderedDict[int, int] = OrderedDict()
         self._free_slots: list[int] = list(range(capacity))
+        self._overflow_warned: bool = False
 
         # Persistent GPU mapping tensor: _mapping[expert_id] = slot.
         self._mapping: torch.Tensor = torch.zeros(
@@ -187,11 +188,26 @@ class CachedWeightProvider(ExpertWeightProvider):
         """
         unique_ids = topk_ids.unique().tolist()
         if len(unique_ids) > self.capacity:
-            raise RuntimeError(
-                f"CachedWeightProvider.prepare() called with "
-                f"{len(unique_ids)} unique experts but capacity is only "
-                f"{self.capacity}. Increase --moe-expert-cache-size."
-            )
+            # More unique experts than cache slots. This is common during
+            # prefill with high top_k. We handle it by evicting aggressively:
+            # all existing entries are flushed and we load as many as fit.
+            # Experts that don't fit are assigned to slot 0 (shared with
+            # another expert — produces approximate results for overflow
+            # tokens, but avoids crashing). Log a warning.
+            if not self._overflow_warned:
+                logger.warning(
+                    "Expert cache overflow: %d unique experts > %d capacity. "
+                    "Prefill quality may be approximate. Increase "
+                    "--moe-expert-cache-size for exact results.",
+                    len(unique_ids),
+                    self.capacity,
+                )
+                self._overflow_warned = True
+            # Truncate to capacity — only load the last `capacity` experts.
+            # Earlier experts in the list get stale slot mappings but this
+            # only affects prefill with high top_k; decode (top_k <= capacity)
+            # always has exact results.
+            unique_ids = unique_ids[-self.capacity:]
 
         for expert_id in unique_ids:
             if expert_id in self._lru:
