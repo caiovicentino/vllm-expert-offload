@@ -106,13 +106,10 @@ class OffloadConfig:
     parallelism (EP > 1).
     """
 
-    moe_expert_cache_policy: Literal["lru", "lfu", "fifo", "slru"] = "lru"
-    """Cache eviction policy for MoE expert weights. Options:
-    - "lru": Least Recently Used (default, best for temporal locality)
-    - "lfu": Least Frequently Used (best for skewed access patterns)
-    - "fifo": First In First Out (simple, predictable eviction order)
-    - "slru": Segmented LRU (two-tier cache, best for mixed workloads)
-    Only used when moe_expert_cache_size > 0.
+    moe_expert_cache_policy: Literal["lru"] = "lru"
+    """Cache eviction policy for MoE expert weights. Currently only LRU
+    (Least Recently Used) is supported. Only used when
+    moe_expert_cache_size > 0.
     """
 
     @model_validator(mode="after")

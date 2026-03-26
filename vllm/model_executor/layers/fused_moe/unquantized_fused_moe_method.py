@@ -366,6 +366,22 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         assert self.kernel is not None
 
+        provider = getattr(layer, "expert_weight_provider", None)
+        if provider is not None:
+            result = provider.prepare(topk_ids)
+            return self.kernel.apply(
+                hidden_states=x,
+                w1=result.w1,
+                w2=result.w2,
+                topk_weights=topk_weights,
+                topk_ids=result.topk_ids,
+                activation=layer.activation,
+                apply_router_weight_on_input=layer.apply_router_weight_on_input,
+                global_num_experts=layer.global_num_experts,
+                expert_map=layer.expert_map,
+                shared_experts_input=shared_experts_input,
+            )
+
         return self.kernel.apply(
             hidden_states=x,
             w1=layer.w13_weight,
