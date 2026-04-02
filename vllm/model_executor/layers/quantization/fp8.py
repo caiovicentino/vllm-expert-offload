@@ -930,6 +930,23 @@ class Fp8MoEMethod(FusedMoEMethodBase):
     ) -> torch.Tensor:
         assert not self.is_monolithic
         assert self.moe_kernel is not None
+
+        provider = getattr(layer, "expert_weight_provider", None)
+        if provider is not None:
+            result = provider.prepare(topk_ids)
+            return self.moe_kernel.apply(
+                x,
+                result.w1,
+                result.w2,
+                topk_weights,
+                result.topk_ids,
+                activation=layer.activation,
+                global_num_experts=layer.global_num_experts,
+                expert_map=layer.expert_map,
+                apply_router_weight_on_input=(layer.apply_router_weight_on_input),
+                shared_experts_input=shared_experts_input,
+            )
+
         return self.moe_kernel.apply(
             x,
             layer.w13_weight,
