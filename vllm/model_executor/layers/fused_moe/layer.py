@@ -607,7 +607,7 @@ class FusedMoE(CustomOp):
                 (self.enable_eplb and backend != "allgather_reducescatter")
                 or self.moe_parallel_config.use_fi_nvl_two_sided_kernels
             )
-            and self._shared_experts is not None
+            and self.shared_experts is not None
         )
 
         self.quant_method.create_weights(layer=self, **moe_quant_params)
