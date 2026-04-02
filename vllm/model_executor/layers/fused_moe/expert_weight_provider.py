@@ -91,6 +91,7 @@ class CachedWeightProvider(ExpertWeightProvider):
         self._num_experts = num_experts
         self.hits = 0
         self.misses = 0
+        self._overflow_warned = False
         self._last_log_time: float = 0.0
 
         if w13_weight.device.type == "cpu":
@@ -187,11 +188,18 @@ class CachedWeightProvider(ExpertWeightProvider):
         """
         unique_ids = topk_ids.unique().tolist()
         if len(unique_ids) > self.capacity:
-            raise RuntimeError(
-                f"CachedWeightProvider.prepare() called with "
-                f"{len(unique_ids)} unique experts but capacity is only "
-                f"{self.capacity}. Increase --moe-expert-cache-size."
-            )
+            # Prefill overflow: more unique experts than cache slots.
+            # Process only the last `capacity` experts (most likely to be
+            # needed in upcoming decode steps). Warn once.
+            if not self._overflow_warned:
+                logger.warning(
+                    "CachedWeightProvider.prepare() called with %d unique "
+                    "experts but capacity is only %d. Truncating to last %d. "
+                    "This is expected during prefill with large batches.",
+                    len(unique_ids), self.capacity, self.capacity,
+                )
+                self._overflow_warned = True
+            unique_ids = unique_ids[-self.capacity:]
 
         for expert_id in unique_ids:
             if expert_id in self._lru:
