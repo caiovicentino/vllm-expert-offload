@@ -97,7 +97,7 @@ class OffloadConfig:
     moe_expert_cache_size: int = Field(default=0, ge=0)
     """Number of MoE expert weight rows to keep in a GPU cache buffer."""
 
-    moe_expert_cache_policy: Literal["lru"] = "lru"
+    moe_expert_cache_policy: Literal["lru", "lfu", "fifo", "slru"] = "lru"
     """Cache eviction policy for MoE expert weights."""
 
     @model_validator(mode="after")
