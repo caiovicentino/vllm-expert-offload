@@ -284,6 +284,8 @@ class FusedMoE(CustomOp):
         super().__init__()
 
         self._routed_input_transform = routed_input_transform
+        self._gate = gate
+        self._shared_experts_init = shared_experts
 
         if params_dtype is None:
             params_dtype = torch.get_default_dtype()
@@ -681,12 +683,13 @@ class FusedMoE(CustomOp):
             moe_config=self.moe_config,
             router=self.router,
             routed_input_transform=self._routed_input_transform,
-            gate=gate,
-            shared_experts=shared_experts,
+            gate=self._gate,
+            shared_experts=self._shared_experts_init,
             quant_method=self.quant_method,
             reduce_results=self.reduce_results,
             enable_dbo=self.vllm_config.parallel_config.enable_dbo,
         )
+        return self.runner
 
     # TODO(bnell): This method is provided as a hook so vllm/lora/layers/fused_moe.py
     # can safely swap out the quant_method. We should figure out a less

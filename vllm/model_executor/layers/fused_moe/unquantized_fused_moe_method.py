@@ -269,6 +269,16 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
             if cache_active:
                 self.moe_quant_config = self.get_fused_moe_quant_config(layer)
                 layer._maybe_init_expert_lru_cache()
+                # Still need to create the kernel (forward_native requires it)
+                if self.moe_kernel is None:
+                    self.moe_kernel = make_unquantized_moe_kernel(
+                        quant_config=self.moe_quant_config,
+                        moe_config=self.moe,
+                        backend=self.unquantized_backend,
+                        experts_cls=self.experts_cls,
+                        routing_tables=layer._maybe_init_expert_routing_tables(),
+                        shared_experts=getattr(layer, 'shared_experts', None),
+                    )
             else:
                 self._setup_kernel(
                     layer=layer,
