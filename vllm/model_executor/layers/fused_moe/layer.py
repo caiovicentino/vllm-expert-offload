@@ -6,7 +6,9 @@ from enum import Enum
 from typing import TYPE_CHECKING, Literal, cast, get_args, overload
 
 if TYPE_CHECKING:
-    from vllm.model_executor.layers.fused_moe.lru_cache import ExpertLRUCache
+    from vllm.model_executor.layers.fused_moe.expert_weight_provider import (
+        CachedWeightProvider,
+    )
 
 import torch
 from torch.nn.parameter import UninitializedParameter
@@ -567,43 +569,33 @@ class FusedMoE(CustomOp):
         ):
             moe_quant_params["intermediate_size_full"] = intermediate_size
 
-        # Expert LRU cache: populated after weight loading via
+        # Expert weight provider: populated after weight loading via
         # _maybe_init_expert_lru_cache().  Initialized *before*
         # create_weights so that create_weights can inspect
         # _moe_expert_cache_size and allocate expert weights on CPU pinned
         # memory when offloading is requested.
-        self._expert_lru_cache: ExpertLRUCache | None = None
-        self._cache_quant_config: FusedMoEQuantConfig | None = None
-        self._overflow_warned = False
-        self._cache_stats_last_log: float = 0.0
-        self._log_cache_stats: bool = (
-            vllm_config.observability_config.enable_logging_iteration_details
-        )
+        self.expert_weight_provider: CachedWeightProvider | None = None
         self._moe_expert_cache_size = vllm_config.offload_config.moe_expert_cache_size
         if self._moe_expert_cache_size > 0 and self.use_ep:
-            logger.warning(
+            raise ValueError(
                 "moe_expert_cache_size is not compatible with expert "
-                "parallelism (ep_size=%d). Expert LRU cache is disabled.",
-                self.ep_size,
+                f"parallelism (ep_size={self.ep_size})."
             )
-            self._moe_expert_cache_size = 0
         if self._moe_expert_cache_size > 0 and (
             self.moe_parallel_config.dp_size > 1 or self.is_sequence_parallel
         ):
-            logger.warning(
+            raise ValueError(
                 "moe_expert_cache_size is not compatible with data parallelism "
-                "or sequence parallelism. Expert LRU cache is disabled."
+                "or sequence parallelism."
             )
-            self._moe_expert_cache_size = 0
         if self._moe_expert_cache_size > 0 and (
             not vllm_config.model_config.enforce_eager
         ):
-            logger.warning(
+            raise ValueError(
                 "moe_expert_cache_size requires --enforce-eager; CUDA graph "
                 "capture with an active expert cache produces incorrect "
-                "results. Expert LRU cache is disabled."
+                "results."
             )
-            self._moe_expert_cache_size = 0
 
         # Disable shared expert overlap if:
         #   - we are using eplb with non-default backend, because of correctness issues
@@ -626,7 +618,7 @@ class FusedMoE(CustomOp):
         self.runner = self._init_runner()
 
     def _maybe_init_expert_lru_cache(self) -> None:
-        """Initialize the expert LRU cache after weights have been loaded.
+        """Initialize the expert weight provider after weights have been loaded.
 
         Expert weights may reside on CPU (loaded directly into pinned memory
         when GPU capacity is insufficient) or on GPU (standard load path).
@@ -635,70 +627,41 @@ class FusedMoE(CustomOp):
 
         Must be called only once, after :meth:`process_weights_after_loading`.
         """
-        if self._moe_expert_cache_size == 0 or self._expert_lru_cache is not None:
+        if self._moe_expert_cache_size == 0 or self.expert_weight_provider is not None:
             return
         if not hasattr(self, "w13_weight") or not hasattr(self, "w2_weight"):
-            logger.warning(
+            raise ValueError(
                 "moe_expert_cache_size requires w13_weight and w2_weight "
-                "parameters. Expert LRU cache is disabled for layer %s.",
-                self.layer_name,
+                f"parameters but they are missing on layer {self.layer_name}."
             )
-            return
         if self.moe_config.has_bias:
-            logger.warning(
+            raise ValueError(
                 "Expert LRU cache does not support MoE layers with bias "
                 "terms (fused_experts() receives w1/w2 only, not bias). "
-                "Cache disabled for layer %s.",
-                self.layer_name,
+                f"Layer: {self.layer_name}."
             )
-            return
-        from vllm.model_executor.layers.fused_moe.lru_cache import (
-            ExpertLRUCache,
+        from vllm.model_executor.layers.fused_moe.expert_weight_provider import (
+            CachedWeightProvider,
         )
 
-        # Detect per-expert weight scales for quantized models (e.g. FP8).
-        # Only 1-D per-expert scales (shape [num_experts]) are supported;
-        # scalars (dim==0) and multi-dimensional block-quant scales (dim>1)
-        # cannot be remapped per-slot and are excluded.
         w13_scale = getattr(self, "w13_weight_scale", None)
         w2_scale = getattr(self, "w2_weight_scale", None)
         if w13_scale is not None and (
             w13_scale.dim() != 1 or w13_scale.size(0) != self.local_num_experts
         ):
-            # Not a 1-D per-expert scale — incompatible with slot remapping.
             w13_scale = None
             w2_scale = None
 
         capacity = min(self._moe_expert_cache_size, self.local_num_experts)
-        policy = self.vllm_config.offload_config.moe_expert_cache_policy
-        self._expert_lru_cache = ExpertLRUCache(
+        self.expert_weight_provider = CachedWeightProvider(
             capacity=capacity,
             w13_weight=self.w13_weight.data,
             w2_weight=self.w2_weight.data,
             w13_scale=w13_scale,
             w2_scale=w2_scale,
-            policy=policy,
         )
-        # Pre-build the quant config once using the cache's slot-indexed
-        # scale buffers.  The buffer tensor objects have stable addresses
-        # (allocated once), so a single config is valid for every forward
-        # pass.  This keeps quant-format-specific logic out of the forward
-        # path and avoids per-call import + construction overhead.
-        if self._expert_lru_cache.buf_w13_scale is not None:
-            from vllm.model_executor.layers.fused_moe.config import (
-                fp8_w8a8_moe_quant_config,
-            )
 
-            self._cache_quant_config = fp8_w8a8_moe_quant_config(
-                w1_scale=self._expert_lru_cache.buf_w13_scale,
-                w2_scale=self._expert_lru_cache.buf_w2_scale,
-                a1_scale=getattr(self, "w13_input_scale", None),
-                a2_scale=getattr(self, "w2_input_scale", None),
-            )
-        else:
-            self._cache_quant_config = None
-
-        # Release the full weight tensors (ExpertLRUCache holds its own
+        # Release the full weight tensors (CachedWeightProvider holds its own
         # reference to the CPU pinned backing store).
         self.w13_weight.data = torch.empty(0)
         self.w2_weight.data = torch.empty(0)
@@ -1666,184 +1629,10 @@ class FusedMoE(CustomOp):
         hidden_states: torch.Tensor,
         router_logits: torch.Tensor,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
-        if self._expert_lru_cache is not None:
-            return self._forward_with_expert_cache(hidden_states, router_logits)
         return self.runner.forward(
             hidden_states,
             router_logits,
         )
-
-    def _moe_forward_cpu(
-        self,
-        hidden_states: torch.Tensor,
-        topk_weights: torch.Tensor,
-        topk_ids: torch.Tensor,
-    ) -> torch.Tensor:
-        """MoE forward on CPU using pinned backing store.
-
-        Used as a fallback when more unique experts are needed than fit in
-        the GPU cache (common during prefill with diverse routing).  Reads
-        expert weights directly from the CPU pinned backing store — no
-        cache state is mutated, so the GPU cache remains valid for
-        subsequent decode steps.
-
-        Groups all tokens routed to each expert into a single batched
-        ``F.linear`` call so that the expert weight matrix (often 16-32 MB)
-        is loaded from RAM once and reused across multiple token rows in
-        L3 cache, rather than reloaded per token.
-        """
-        import torch.nn.functional as F
-
-        assert self._expert_lru_cache is not None
-        cache = self._expert_lru_cache
-        num_tokens, top_k = topk_ids.shape
-        hidden_size = hidden_states.size(-1)
-
-        cpu_h = hidden_states.cpu().float()
-        cpu_ids = topk_ids.cpu()
-        cpu_w = topk_weights.cpu().float()
-        output = torch.zeros(num_tokens, hidden_size, dtype=torch.float32)
-
-        # Group token-slot pairs by expert for batched F.linear.
-        expert_batches: dict[int, list[tuple[int, float]]] = {}
-        for i in range(num_tokens):
-            for j in range(top_k):
-                eid = cpu_ids[i, j].item()
-                wt = cpu_w[i, j].item()
-                expert_batches.setdefault(eid, []).append((i, wt))
-
-        for eid, token_weights in expert_batches.items():
-            indices = [tw[0] for tw in token_weights]
-            weights = torch.tensor([tw[1] for tw in token_weights], dtype=torch.float32)
-
-            batch_h = cpu_h[indices]  # [batch, hidden]
-            if self.apply_router_weight_on_input:
-                batch_h = batch_h * weights.unsqueeze(1)
-
-            # gate/up projection: [batch, hidden] -> [batch, 2*intermediate]
-            w13 = cache._cpu_w13[eid].float()
-            gate_up = F.linear(batch_h, w13)
-            gate, up = gate_up.chunk(2, dim=-1)
-            activated = F.silu(gate) * up
-
-            # down projection: [batch, intermediate] -> [batch, hidden]
-            w2 = cache._cpu_w2[eid].float()
-            down = F.linear(activated, w2)
-
-            if not self.apply_router_weight_on_input:
-                down = down * weights.unsqueeze(1)
-
-            # Scatter-add back to output
-            for k, token_idx in enumerate(indices):
-                output[token_idx] += down[k]
-
-        return output.to(dtype=hidden_states.dtype, device=hidden_states.device)
-
-    @torch.compiler.disable
-    def _forward_with_expert_cache(
-        self,
-        hidden_states: torch.Tensor,
-        router_logits: torch.Tensor,
-    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
-        """Forward pass using the expert LRU cache.
-
-        Computes routing, populates the GPU cache for the required experts,
-        and calls :func:`fused_experts` with remapped expert IDs and the
-        GPU scratch buffers instead of the full weight tensors.
-
-        Return type mirrors the normal runner path:
-        - ``(shared_output, routed_output)`` when ``use_overlapped=True``
-          (i.e. when shared experts are present); the caller adds them.
-        - plain ``routed_output`` tensor otherwise.
-
-        Not compatible with CUDA graph capture or expert parallelism.
-
-        .. note::
-            This method bypasses :meth:`runner.forward` and calls
-            :func:`fused_experts` directly.  It therefore does **not**
-            participate in DP chunking, EP dispatch/combine, or the
-            modular-kernel prepare/finalize pipeline.  A future PR should
-            integrate the cache into the runner via an
-            ``ExpertWeightProvider`` abstraction (see RFC #33869) so that
-            all runner features work transparently with caching.
-        """
-        assert self._expert_lru_cache is not None
-        from vllm.model_executor.layers.fused_moe.fused_moe import fused_experts
-
-        # fused_experts_impl requires 2-D contiguous input [num_tokens, hidden].
-        orig_shape = None
-        if hidden_states.dim() == 3:
-            orig_shape = hidden_states.shape
-            hidden_states = hidden_states.flatten(0, 1)
-        hidden_states = hidden_states.contiguous()
-
-        topk_weights, topk_ids = self.router.select_experts(
-            hidden_states=hidden_states,
-            router_logits=router_logits,
-        )
-
-        unique_count = topk_ids.unique().numel()
-        if unique_count <= self._expert_lru_cache.capacity:
-            # Fast GPU path: all needed experts fit in the cache.
-            new_topk_ids = self._expert_lru_cache.prepare(topk_ids)
-            routed_output = fused_experts(
-                hidden_states=hidden_states,
-                w1=self._expert_lru_cache.buf_w13,
-                w2=self._expert_lru_cache.buf_w2,
-                topk_weights=topk_weights,
-                topk_ids=new_topk_ids,
-                activation=self.activation,
-                apply_router_weight_on_input=self.apply_router_weight_on_input,
-                quant_config=self._cache_quant_config,
-            )
-        else:
-            # Overflow: more unique experts than cache capacity (common
-            # during prefill when many tokens route to diverse experts).
-            # Fall back to CPU compute using the pinned backing store
-            # directly — no cache state mutation, always correct.
-            if not self._overflow_warned:
-                self._overflow_warned = True
-                logger.warning(
-                    "Expert cache overflow: %d unique experts > %d "
-                    "capacity.  Using CPU fallback for this batch.  "
-                    "Increase --moe-expert-cache-size to avoid this.",
-                    unique_count,
-                    self._expert_lru_cache.capacity,
-                )
-            routed_output = self._moe_forward_cpu(hidden_states, topk_weights, topk_ids)
-
-        if orig_shape is not None:
-            routed_output = routed_output.view(orig_shape)
-
-        if self._log_cache_stats:
-            import time
-
-            now = time.monotonic()
-            if now - self._cache_stats_last_log >= 300.0:
-                self._cache_stats_last_log = now
-                cache = self._expert_lru_cache
-                total = cache.hits + cache.misses
-                if total > 0:
-                    logger.info(
-                        "%s expert cache: %d hits, %d misses (%.1f%% hit rate)",
-                        self.layer_name,
-                        cache.hits,
-                        cache.misses,
-                        100.0 * cache.hits / total,
-                    )
-
-        if self.use_overlapped and self._shared_experts is not None:
-            # Match the normal runner's return convention: return a tuple so
-            # the outer model layer (e.g. DeepseekV2MoE) can add them.
-            shared_input = (
-                hidden_states
-                if orig_shape is None
-                else (hidden_states.view(orig_shape))
-            )
-            shared_output = self._shared_experts(shared_input)
-            return shared_output, routed_output
-
-        return routed_output
 
     @property
     def expert_map(self) -> torch.Tensor | None:

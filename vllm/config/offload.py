@@ -94,6 +94,12 @@ class OffloadConfig:
     prefetch: PrefetchOffloadConfig = Field(default_factory=PrefetchOffloadConfig)
     """Parameters for prefetch offloading backend."""
 
+    moe_expert_cache_size: int = Field(default=0, ge=0)
+    """Number of MoE expert weight rows to keep in a GPU cache buffer."""
+
+    moe_expert_cache_policy: Literal["lru"] = "lru"
+    """Cache eviction policy for MoE expert weights."""
+
     @model_validator(mode="after")
     def validate_offload_config(self) -> "OffloadConfig":
         """Validate offload configuration constraints."""
