@@ -249,3 +249,110 @@ class CachedWeightProvider(ExpertWeightProvider):
             w1_scale=self._buf_w13_scale,
             w2_scale=self._buf_w2_scale,
         )
+
+
+class LFRUCachedWeightProvider(CachedWeightProvider):
+    """GPU LFRU (Least Frequently + Recently Used) cache for MoE experts.
+
+    Extends CachedWeightProvider with frequency-weighted eviction.
+    Standard LRU lets early layers monopolize the cache because they
+    execute first every forward pass. LFRU tracks access frequency per
+    expert and evicts the one with lowest score = frequency * recency.
+
+    On GPT-OSS-20B benchmarks, LFRU improved deep-layer (18-23) hit rate
+    from 0-8% (LRU) to 52-94%.  With 128 experts per layer (Gemma 4,
+    Nemotron), the improvement is expected to be even larger.
+
+    Reference: vllm-project/vllm#37190 (e1n00r)
+    """
+
+    def __init__(self, *args, decay: float = 0.95, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        # Frequency counter per expert (decayed over time)
+        self._freq: dict[int, float] = {}
+        # Monotonic step counter for recency scoring
+        self._step: int = 0
+        # Last access step per expert
+        self._last_access: dict[int, int] = {}
+        # Decay factor: controls how fast old frequency decays
+        self._decay = decay
+
+    def _score(self, expert_id: int) -> float:
+        """Compute eviction score: lower = more likely to evict."""
+        freq = self._freq.get(expert_id, 0.0)
+        recency = self._step - self._last_access.get(expert_id, 0)
+        # Combine frequency and recency: high freq + recent = high score (keep)
+        return freq / (1.0 + recency)
+
+    @torch.compiler.disable
+    def prepare(self, topk_ids: torch.Tensor) -> ExpertWeightResult:
+        self._step += 1
+
+        unique_ids = topk_ids.unique().tolist()
+        if len(unique_ids) > self.capacity:
+            if not self._overflow_warned:
+                logger.warning(
+                    "LFRUCachedWeightProvider.prepare() called with %d unique "
+                    "experts but capacity is only %d. Truncating to last %d.",
+                    len(unique_ids), self.capacity, self.capacity,
+                )
+                self._overflow_warned = True
+            unique_ids = unique_ids[-self.capacity:]
+
+        for expert_id in unique_ids:
+            # Update frequency (decayed)
+            self._freq[expert_id] = self._freq.get(expert_id, 0.0) * self._decay + 1.0
+            self._last_access[expert_id] = self._step
+
+            if expert_id in self._lru:
+                # Cache hit
+                self._lru.move_to_end(expert_id)
+                self.hits += 1
+            else:
+                # Cache miss
+                if self._free_slots:
+                    slot = self._free_slots.pop()
+                else:
+                    # Evict expert with lowest LFRU score
+                    min_score = float("inf")
+                    victim_id = next(iter(self._lru))  # fallback to LRU
+                    for eid in self._lru:
+                        s = self._score(eid)
+                        if s < min_score:
+                            min_score = s
+                            victim_id = eid
+                    slot = self._lru.pop(victim_id)
+
+                # Copy from CPU to GPU
+                self._buf_w13[slot].copy_(self._cpu_w13[expert_id])
+                self._buf_w2[slot].copy_(self._cpu_w2[expert_id])
+                if self._buf_w13_scale is not None:
+                    assert self._cpu_w13_scale is not None
+                    assert self._cpu_w2_scale is not None
+                    assert self._buf_w2_scale is not None
+                    self._buf_w13_scale[slot].copy_(self._cpu_w13_scale[expert_id])
+                    self._buf_w2_scale[slot].copy_(self._cpu_w2_scale[expert_id])
+
+                self._lru[expert_id] = slot
+                self._mapping[expert_id] = slot
+                self.misses += 1
+
+        now = time.monotonic()
+        if now - self._last_log_time >= 60.0:
+            self._last_log_time = now
+            total = self.hits + self.misses
+            if total > 0:
+                logger.debug(
+                    "Expert LFRU cache: %d hits, %d misses (%.1f%% hit rate)",
+                    self.hits, self.misses, 100.0 * self.hits / total,
+                )
+
+        remapped_ids = self._mapping[topk_ids.long()].to(dtype=topk_ids.dtype)
+
+        return ExpertWeightResult(
+            w1=self._buf_w13,
+            w2=self._buf_w2,
+            topk_ids=remapped_ids,
+            w1_scale=self._buf_w13_scale,
+            w2_scale=self._buf_w2_scale,
+        )
