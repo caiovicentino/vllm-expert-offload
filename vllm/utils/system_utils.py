@@ -76,7 +76,12 @@ def suppress_stdout():
         yield
         return
 
-    stdout_fd = sys.stdout.fileno()
+    try:
+        stdout_fd = sys.stdout.fileno()
+    except Exception:
+        # Jupyter/Colab: stdout has no fileno, skip suppression
+        yield
+        return
     stdout_dup = os.dup(stdout_fd)
     devnull_fd = os.open(os.devnull, os.O_WRONLY)
 
