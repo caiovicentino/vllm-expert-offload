@@ -1,3 +1,31 @@
+# ⚠️ This fork has been merged upstream!
+
+**Expert offloading is now native in vLLM.** Use the official package:
+
+```bash
+pip install vllm
+vllm serve google/gemma-4-26B-A4B-it --moe-expert-cache-size 8 --enforce-eager
+```
+
+## Merged Commit
+
+https://github.com/vllm-project/vllm/commit/73a7584ae781d3a959ec90e4a8ed680ccfd8444a
+
+```
+Co-authored-by: Caio Vicentino <caiovicentino@Mac.lan>
+```
+
+## Original Results (from this fork)
+
+| Model | VRAM | tok/s |
+|---|---|---|
+| Nemotron 30B-A3B | 7.6 GB | 15 tok/s |
+| Gemma 4 26B-A4B | 8.6 GB | 14.8 tok/s |
+
+## This fork is archived. Use `pip install vllm` instead.
+
+---
+
 <!-- markdownlint-disable MD001 MD041 -->
 <p align="center">
   <picture>
