@@ -225,12 +225,32 @@ class CompressedTensorsWNA16MarlinMoEMethod(CompressedTensorsMoEMethod):
             except Exception:
                 pass
 
-        # Disk-backed cache directory.  We explicitly avoid /tmp (often
-        # tmpfs / memory-backed on Linux containers) by preferring an
-        # env-override first, then /content (Colab), then /dev/shm
-        # (tmpfs, last resort).  Files survive the run; the kernel
-        # cleans them up after session exit.
+        # Cold tier mode: disk-backed mmap (default) or regular CPU RAM.
+        #
+        #   disk: torch.from_file(shared=True) — scales to host RAM via OS
+        #         page cache; files are written during weight_loader which
+        #         may push overlay filesystems past their limit for very
+        #         large MoE models (e.g. MiniMax-M2.7 229B on Colab Pro+).
+        #
+        #   ram:  torch.empty(device="cpu") — holds the whole model in
+        #         anonymous CPU memory during load. Requires ~1.87 GB per
+        #         layer of RAM, but avoids disk pressure entirely. When
+        #         VLLM_MOE_RAM_TIER_SIZE=-1 the Phase 2 pre-pop path
+        #         frees the regular CPU tensors after copying to the
+        #         pinned RAM tier, so the transient RAM cost is bounded.
+        #
+        # Auto-selected: if the user has asked for a full RAM tier
+        # (VLLM_MOE_RAM_TIER_SIZE=-1), ram mode is the right choice.
+        # Otherwise we default to disk mode for backward compatibility.
         import os as _os
+        _cold_mode = _os.environ.get("VLLM_MOE_COLD_TIER_MODE", "").lower()
+        if not _cold_mode:
+            if _os.environ.get("VLLM_MOE_RAM_TIER_SIZE", "0") == "-1":
+                _cold_mode = "ram"
+            else:
+                _cold_mode = "disk"
+        self._cold_tier_mode = _cold_mode
+
         _pid = _os.getpid()
         _override = _os.environ.get("VLLM_CTMOE_CACHE_DIR")
         if _override:
@@ -240,9 +260,11 @@ class CompressedTensorsWNA16MarlinMoEMethod(CompressedTensorsMoEMethod):
         else:
             _cache_base = "/tmp/ctmoe_cache"
         _cache_dir = f"{_cache_base}_{_pid}"
-        _os.makedirs(_cache_dir, exist_ok=True)
+        if _cold_mode == "disk":
+            _os.makedirs(_cache_dir, exist_ok=True)
         logger.info_once(
-            "CT WNA16 Marlin disk-backed cache dir: %s", _cache_dir, scope="local"
+            "CT WNA16 Marlin cold tier mode: %s (dir=%s)",
+            _cold_mode, _cache_dir, scope="local",
         )
         _layer_name = getattr(layer, "layer_name", f"layer_{id(layer)}")
         _safe_name = _layer_name.replace("/", "_").replace(".", "_")
@@ -268,6 +290,10 @@ class CompressedTensorsWNA16MarlinMoEMethod(CompressedTensorsMoEMethod):
 
         def _empty_packed(shape, tag):
             if use_cpu_pinned:
+                if _cold_mode == "ram":
+                    # Regular CPU tensor; will be freed later by the
+                    # prepopulate + drop_cold flow in Phase 2.
+                    return torch.empty(*shape, dtype=torch.int32, device="cpu")
                 # Disk-backed via mmap: backing store lives on SSD, OS
                 # page cache handles hot pages. No pinned memory.
                 return _disk_backed(shape, torch.int32, tag)
@@ -326,7 +352,10 @@ class CompressedTensorsWNA16MarlinMoEMethod(CompressedTensorsMoEMethod):
 
         def _ones_scale(shape, tag):
             if use_cpu_pinned:
-                # Same disk-backed mmap; fill with 1.0 in place.
+                if _cold_mode == "ram":
+                    t = torch.empty(*shape, dtype=params_dtype, device="cpu")
+                    t.fill_(1.0)
+                    return t
                 t = _disk_backed(shape, params_dtype, tag)
                 t.fill_(1.0)
                 return t
@@ -639,11 +668,25 @@ class CompressedTensorsWNA16MarlinMoEMethod(CompressedTensorsMoEMethod):
             (num_experts, 0), dtype=torch.int32, device=gpu
         )
 
-        def _to_disk_backed(
-            tensor_on_gpu: torch.Tensor, tag: str
-        ) -> torch.Tensor:
-            """Write a GPU tensor to a disk-backed file and return a
-            view of the file with the tensor's shape."""
+        cold_mode = getattr(self, "_cold_tier_mode", "disk")
+
+        def _to_cold(tensor_on_gpu: torch.Tensor, tag: str) -> torch.Tensor:
+            """Write a GPU tensor back to the cold tier (disk-backed file
+            or regular CPU memory, depending on cold_mode)."""
+            if cold_mode == "ram":
+                # Allocate a new regular CPU tensor and copy from GPU.
+                # The previous cold tensor is unreferenced here — caller
+                # will assign this return value into layer.*.data,
+                # which drops the previous reference and frees the old
+                # regular CPU allocation.
+                cpu_view = torch.empty(
+                    tensor_on_gpu.shape,
+                    dtype=tensor_on_gpu.dtype,
+                    device="cpu",
+                )
+                cpu_view.copy_(tensor_on_gpu.cpu(), non_blocking=False)
+                return cpu_view
+
             path = f"{cache_dir}/{safe_name}_{tag}.bin"
             numel = tensor_on_gpu.numel()
             disk = torch.from_file(
@@ -652,6 +695,9 @@ class CompressedTensorsWNA16MarlinMoEMethod(CompressedTensorsMoEMethod):
             disk_view = disk.view(*tensor_on_gpu.shape)
             disk_view.copy_(tensor_on_gpu.cpu(), non_blocking=False)
             return disk_view
+
+        # Backward-compat alias for existing call sites.
+        _to_disk_backed = _to_cold
 
         def _repack_to_disk(
             param_data: torch.Tensor, tag: str, size_k: int, size_n: int
@@ -802,13 +848,15 @@ class CompressedTensorsWNA16MarlinMoEMethod(CompressedTensorsMoEMethod):
             layer.expert_weight_provider.drop_cold_tensors()
 
             # Delete the disk-backed files -- data is now in pinned RAM.
-            import os as _os_local
-            for tag in ("w13_packed", "w2_packed", "w13_scale", "w2_scale"):
-                path = f"{cache_dir}/{safe_name}_{tag}.bin"
-                try:
-                    _os_local.remove(path)
-                except OSError:
-                    pass
+            # Skipped in ram cold mode because there are no files on disk.
+            if cold_mode == "disk":
+                import os as _os_local
+                for tag in ("w13_packed", "w2_packed", "w13_scale", "w2_scale"):
+                    path = f"{cache_dir}/{safe_name}_{tag}.bin"
+                    try:
+                        _os_local.remove(path)
+                    except OSError:
+                        pass
         elif ram_capacity > 0:
             logger.info_once(
                 "CT WNA16 Marlin tiered cache: GPU %d + RAM %d + disk "
