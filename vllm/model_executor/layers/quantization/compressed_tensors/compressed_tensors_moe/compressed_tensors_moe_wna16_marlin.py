@@ -221,16 +221,46 @@ class CompressedTensorsWNA16MarlinMoEMethod(CompressedTensorsMoEMethod):
             except Exception:
                 pass
 
-        def _empty_packed(shape):
+        # Disk-backed cache directory.  We explicitly avoid /tmp (often
+        # tmpfs / memory-backed on Linux containers) by preferring an
+        # env-override first, then /content (Colab), then /dev/shm
+        # (tmpfs, last resort).  Files survive the run; the kernel
+        # cleans them up after session exit.
+        import os as _os
+        _pid = _os.getpid()
+        _override = _os.environ.get("VLLM_CTMOE_CACHE_DIR")
+        if _override:
+            _cache_base = _override
+        elif _os.path.isdir("/content"):
+            _cache_base = "/content/ctmoe_cache"
+        else:
+            _cache_base = "/tmp/ctmoe_cache"
+        _cache_dir = f"{_cache_base}_{_pid}"
+        _os.makedirs(_cache_dir, exist_ok=True)
+        logger.info_once(
+            "CT WNA16 Marlin disk-backed cache dir: %s", _cache_dir, scope="local"
+        )
+        _layer_name = getattr(layer, "layer_name", f"layer_{id(layer)}")
+        _safe_name = _layer_name.replace("/", "_").replace(".", "_")
+
+        def _disk_backed(shape, dtype, name):
+            numel = 1
+            for d in shape:
+                numel *= d
+            path = f"{_cache_dir}/{_safe_name}_{name}.bin"
+            # from_file creates or opens the file, mmap'd. shared=True
+            # makes writes land in the file (and thus on disk, not RAM).
+            # The OS page cache keeps hot pages in RAM automatically.
+            t = torch.from_file(
+                path, shared=True, size=numel, dtype=dtype
+            )
+            return t.view(*shape)
+
+        def _empty_packed(shape, tag):
             if use_cpu_pinned:
-                # pin_memory=True kwarg allocates DIRECTLY in pinned memory
-                # (no intermediate non-pinned tensor). The old
-                # torch.empty(...).pin_memory() pattern creates a
-                # non-pinned source, then a pinned copy, leaving the
-                # source alive until Python GC — doubling peak memory.
-                return torch.empty(
-                    *shape, dtype=torch.int32, device="cpu", pin_memory=True
-                )
+                # Disk-backed via mmap: backing store lives on SSD, OS
+                # page cache handles hot pages. No pinned memory.
+                return _disk_backed(shape, torch.int32, tag)
             return torch.empty(*shape, dtype=torch.int32)
 
         w13_weight = torch.nn.Parameter(
@@ -240,7 +270,8 @@ class CompressedTensorsWNA16MarlinMoEMethod(CompressedTensorsMoEMethod):
                     num_experts,
                     hidden_size,
                     intermediate_size_per_partition,
-                )
+                ),
+                tag="w13_packed",
             ),
             requires_grad=False,
         )
@@ -254,7 +285,8 @@ class CompressedTensorsWNA16MarlinMoEMethod(CompressedTensorsMoEMethod):
                     num_experts,
                     hidden_size,
                     intermediate_size_per_partition,
-                )
+                ),
+                tag="w2_packed",
             ),
             requires_grad=False,
         )
@@ -282,13 +314,10 @@ class CompressedTensorsWNA16MarlinMoEMethod(CompressedTensorsMoEMethod):
         layer.num_groups_w13 = num_groups_w13
         layer.num_groups_w2 = num_groups_w2
 
-        def _ones_scale(shape):
+        def _ones_scale(shape, tag):
             if use_cpu_pinned:
-                # Same direct-pinned allocation as _empty_packed, then
-                # fill with 1.0 in place.
-                t = torch.empty(
-                    *shape, dtype=params_dtype, device="cpu", pin_memory=True
-                )
+                # Same disk-backed mmap; fill with 1.0 in place.
+                t = _disk_backed(shape, params_dtype, tag)
                 t.fill_(1.0)
                 return t
             return torch.ones(*shape, dtype=params_dtype)
@@ -301,7 +330,8 @@ class CompressedTensorsWNA16MarlinMoEMethod(CompressedTensorsMoEMethod):
                     hidden_size,
                     intermediate_size_per_partition,
                     num_groups_w13=num_groups_w13,
-                )
+                ),
+                tag="w13_scale",
             ),
             requires_grad=False,
         )
@@ -316,7 +346,8 @@ class CompressedTensorsWNA16MarlinMoEMethod(CompressedTensorsMoEMethod):
                     hidden_size,
                     intermediate_size_per_partition,
                     num_groups_w2=num_groups_w2,
-                )
+                ),
+                tag="w2_scale",
             ),
             requires_grad=False,
         )
@@ -672,6 +703,7 @@ class CompressedTensorsWNA16MarlinMoEMethod(CompressedTensorsMoEMethod):
             w2_weight=layer.w2_weight_packed.data,
             w13_scale=layer.w13_weight_scale.data,
             w2_scale=layer.w2_weight_scale.data,
+            allow_non_pinned_cpu=True,
         )
 
         # Release parameter bindings.  The provider took direct refs to

@@ -84,6 +84,7 @@ class CachedWeightProvider(ExpertWeightProvider):
         w2_weight: torch.Tensor,
         w13_scale: torch.Tensor | None = None,
         w2_scale: torch.Tensor | None = None,
+        allow_non_pinned_cpu: bool = False,
     ) -> None:
         num_experts = w13_weight.size(0)
 
@@ -96,12 +97,20 @@ class CachedWeightProvider(ExpertWeightProvider):
 
         if w13_weight.device.type == "cpu":
             cuda_device = torch.accelerator.current_accelerator()
-            self._cpu_w13: torch.Tensor = (
-                w13_weight if w13_weight.is_pinned() else w13_weight.pin_memory()
-            )
-            self._cpu_w2: torch.Tensor = (
-                w2_weight if w2_weight.is_pinned() else w2_weight.pin_memory()
-            )
+            if allow_non_pinned_cpu:
+                # Disk-backed (torch.from_file) or regular CPU tensors.
+                # Used for models whose full backing store exceeds host RAM;
+                # the OS page cache handles eviction. Non-blocking copies
+                # to GPU will be slightly slower than pinned DMA.
+                self._cpu_w13 = w13_weight
+                self._cpu_w2 = w2_weight
+            else:
+                self._cpu_w13: torch.Tensor = (
+                    w13_weight if w13_weight.is_pinned() else w13_weight.pin_memory()
+                )
+                self._cpu_w2: torch.Tensor = (
+                    w2_weight if w2_weight.is_pinned() else w2_weight.pin_memory()
+                )
         else:
             cuda_device = w13_weight.device
             self._cpu_w13 = w13_weight.cpu().pin_memory()
