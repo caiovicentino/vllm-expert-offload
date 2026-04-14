@@ -445,3 +445,242 @@ class LFRUCachedWeightProvider(CachedWeightProvider):
             w1_scale=self._buf_w13_scale,
             w2_scale=self._buf_w2_scale,
         )
+
+
+class TieredCachedWeightProvider(LFRUCachedWeightProvider):
+    """3-tier expert cache: GPU (LFRU) -> pinned RAM (LRU) -> cold storage.
+
+    Extends :class:`LFRUCachedWeightProvider` by adding an explicit pinned
+    RAM tier between the GPU slots and the cold backing store.  The idea:
+
+      GPU tier   -- small, fast, frequency-weighted eviction (inherited)
+      RAM tier   -- medium, pinned CPU memory, LRU eviction
+      Cold tier  -- large, the tensor passed to the constructor (disk-backed
+                    mmap or regular CPU, or eventually a HF safetensors
+                    reader callable)
+
+    On a GPU miss we check the RAM tier first.  RAM hits are fast because
+    pinned DMA to GPU is 2-3x faster than paged CPU memory, and we avoid
+    re-reading the cold tier (which for disk-backed storage may incur
+    page-fault reads from SSD).  On a RAM miss we promote cold -> RAM ->
+    GPU in one pass and populate both tiers.
+
+    When ``ram_capacity == 0`` this class behaves exactly like the parent
+    :class:`LFRUCachedWeightProvider`.
+
+    The cold tier can optionally be replaced at runtime with HF
+    safetensors mmap reads via :meth:`set_hf_cold_tier` -- used after the
+    CT MoE offloaded path has processed all layers and wants to delete
+    its intermediate disk-backed files to free disk space, leaving the
+    HF download itself as the source of truth.
+    """
+
+    def __init__(
+        self,
+        capacity: int,
+        w13_weight: torch.Tensor,
+        w2_weight: torch.Tensor,
+        w13_scale: torch.Tensor | None = None,
+        w2_scale: torch.Tensor | None = None,
+        allow_non_pinned_cpu: bool = False,
+        ram_capacity: int = 0,
+    ) -> None:
+        super().__init__(
+            capacity=capacity,
+            w13_weight=w13_weight,
+            w2_weight=w2_weight,
+            w13_scale=w13_scale,
+            w2_scale=w2_scale,
+            allow_non_pinned_cpu=allow_non_pinned_cpu,
+        )
+
+        self.ram_capacity = ram_capacity
+        self.ram_hits = 0
+        self.cold_hits = 0  # GPU misses that also missed the RAM tier
+        self._hf_cold_reader = None  # optional HF-backed deep-cold reader
+
+        if ram_capacity > 0:
+            self._ram_w13: torch.Tensor | None = torch.empty(
+                ram_capacity,
+                *w13_weight.shape[1:],
+                dtype=w13_weight.dtype,
+                device="cpu",
+                pin_memory=True,
+            )
+            self._ram_w2: torch.Tensor | None = torch.empty(
+                ram_capacity,
+                *w2_weight.shape[1:],
+                dtype=w2_weight.dtype,
+                device="cpu",
+                pin_memory=True,
+            )
+            if w13_scale is not None and w2_scale is not None:
+                self._ram_w13_scale: torch.Tensor | None = torch.empty(
+                    ram_capacity,
+                    *w13_scale.shape[1:],
+                    dtype=w13_scale.dtype,
+                    device="cpu",
+                    pin_memory=True,
+                )
+                self._ram_w2_scale: torch.Tensor | None = torch.empty(
+                    ram_capacity,
+                    *w2_scale.shape[1:],
+                    dtype=w2_scale.dtype,
+                    device="cpu",
+                    pin_memory=True,
+                )
+            else:
+                self._ram_w13_scale = None
+                self._ram_w2_scale = None
+
+            self._ram_lru: OrderedDict[int, int] = OrderedDict()
+            self._ram_free_slots: list[int] = list(range(ram_capacity))
+        else:
+            self._ram_w13 = None
+            self._ram_w2 = None
+            self._ram_w13_scale = None
+            self._ram_w2_scale = None
+            self._ram_lru = OrderedDict()
+            self._ram_free_slots = []
+
+    def set_hf_cold_tier(self, reader) -> None:
+        """Install a per-expert HF safetensors reader as the deep cold tier.
+
+        ``reader`` is a callable ``reader(expert_id) -> tuple`` returning
+        ``(w13_tensor, w2_tensor, w13_scale, w2_scale)`` already in the
+        Marlin-repacked layout expected by the cache buffers.  Used after
+        the CT MoE offloaded path has processed all layers and deletes
+        its intermediate disk-backed files -- from then on, deep cold
+        misses (not in GPU, not in RAM, not in our own cold tensor) will
+        hit this reader.  All four return values may be torch CPU tensors;
+        None values are ignored for the scale entries.
+        """
+        self._hf_cold_reader = reader
+
+    def _acquire_ram_slot(self) -> int:
+        """Return a RAM tier slot index, evicting the LRU entry if full."""
+        if self._ram_free_slots:
+            return self._ram_free_slots.pop()
+        _, slot = self._ram_lru.popitem(last=False)
+        return slot
+
+    def _copy_ram_to_gpu(self, gpu_slot: int, ram_slot: int) -> None:
+        """Async pinned DMA: RAM tier slot -> GPU tier slot."""
+        self._buf_w13[gpu_slot].copy_(
+            self._ram_w13[ram_slot], non_blocking=True
+        )
+        self._buf_w2[gpu_slot].copy_(
+            self._ram_w2[ram_slot], non_blocking=True
+        )
+        if self._buf_w13_scale is not None:
+            assert self._ram_w13_scale is not None
+            assert self._ram_w2_scale is not None
+            assert self._buf_w2_scale is not None
+            self._buf_w13_scale[gpu_slot].copy_(
+                self._ram_w13_scale[ram_slot], non_blocking=True
+            )
+            self._buf_w2_scale[gpu_slot].copy_(
+                self._ram_w2_scale[ram_slot], non_blocking=True
+            )
+
+    def _copy_cold_to_ram(self, ram_slot: int, expert_id: int) -> None:
+        """Sync read from cold tier -> RAM slot.
+
+        Uses the HF safetensors reader if installed, otherwise reads from
+        the CPU-side cold tensor (disk-backed mmap or regular CPU)."""
+        if self._hf_cold_reader is not None:
+            w13, w2, s13, s2 = self._hf_cold_reader(expert_id)
+            self._ram_w13[ram_slot].copy_(w13)
+            self._ram_w2[ram_slot].copy_(w2)
+            if self._ram_w13_scale is not None and s13 is not None:
+                self._ram_w13_scale[ram_slot].copy_(s13)
+                self._ram_w2_scale[ram_slot].copy_(s2)
+            return
+
+        self._ram_w13[ram_slot].copy_(self._cpu_w13[expert_id])
+        self._ram_w2[ram_slot].copy_(self._cpu_w2[expert_id])
+        if self._ram_w13_scale is not None:
+            assert self._cpu_w13_scale is not None
+            assert self._cpu_w2_scale is not None
+            self._ram_w13_scale[ram_slot].copy_(self._cpu_w13_scale[expert_id])
+            self._ram_w2_scale[ram_slot].copy_(self._cpu_w2_scale[expert_id])
+
+    @torch.compiler.disable
+    def prepare(self, topk_ids: torch.Tensor) -> ExpertWeightResult:
+        # No RAM tier configured -> fall back to LFRU-only path.
+        if self.ram_capacity == 0:
+            return super().prepare(topk_ids)
+
+        self._step += 1
+        unique_ids = topk_ids.unique().tolist()
+
+        if len(unique_ids) > self.capacity:
+            # Overflow: one-shot per-forward GPU buffer from base class.
+            return self._prepare_overflow(topk_ids, unique_ids)
+
+        for expert_id in unique_ids:
+            self._freq[expert_id] = (
+                self._freq.get(expert_id, 0.0) * self._decay + 1.0
+            )
+            self._last_access[expert_id] = self._step
+
+            if expert_id in self._lru:
+                # GPU tier hit.
+                self._lru.move_to_end(expert_id)
+                if expert_id in self._ram_lru:
+                    self._ram_lru.move_to_end(expert_id)
+                self.hits += 1
+                continue
+
+            # GPU miss: acquire a GPU slot (LFRU eviction if needed).
+            if self._free_slots:
+                gpu_slot = self._free_slots.pop()
+            else:
+                min_score = float("inf")
+                victim_id = next(iter(self._lru))
+                for eid in self._lru:
+                    s = self._score(eid)
+                    if s < min_score:
+                        min_score = s
+                        victim_id = eid
+                gpu_slot = self._lru.pop(victim_id)
+
+            if expert_id in self._ram_lru:
+                ram_slot = self._ram_lru[expert_id]
+                self._ram_lru.move_to_end(expert_id)
+                self._copy_ram_to_gpu(gpu_slot, ram_slot)
+                self.ram_hits += 1
+            else:
+                ram_slot = self._acquire_ram_slot()
+                self._copy_cold_to_ram(ram_slot, expert_id)
+                self._ram_lru[expert_id] = ram_slot
+                self._copy_ram_to_gpu(gpu_slot, ram_slot)
+                self.cold_hits += 1
+                self.misses += 1  # keep parent counter in sync
+
+            self._lru[expert_id] = gpu_slot
+            self._mapping[expert_id] = gpu_slot
+
+        now = time.monotonic()
+        if now - self._last_log_time >= 60.0:
+            self._last_log_time = now
+            total = self.hits + self.ram_hits + self.cold_hits
+            if total > 0:
+                logger.info(
+                    "Tiered expert cache: GPU %d hits, RAM %d hits, "
+                    "cold %d misses (GPU hit %.1f%%, RAM hit %.1f%% of "
+                    "GPU misses)",
+                    self.hits, self.ram_hits, self.cold_hits,
+                    100.0 * self.hits / total,
+                    100.0 * self.ram_hits / max(1, self.ram_hits + self.cold_hits),
+                )
+
+        remapped_ids = self._mapping[topk_ids.long()].to(dtype=topk_ids.dtype)
+
+        return ExpertWeightResult(
+            w1=self._buf_w13,
+            w2=self._buf_w2,
+            topk_ids=remapped_ids,
+            w1_scale=self._buf_w13_scale,
+            w2_scale=self._buf_w2_scale,
+        )

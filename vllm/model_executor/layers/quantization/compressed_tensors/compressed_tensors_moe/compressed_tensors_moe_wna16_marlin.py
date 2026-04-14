@@ -624,7 +624,7 @@ class CompressedTensorsWNA16MarlinMoEMethod(CompressedTensorsMoEMethod):
         the OS page cache.
         """
         from vllm.model_executor.layers.fused_moe.expert_weight_provider import (
-            LFRUCachedWeightProvider,
+            TieredCachedWeightProvider,
         )
 
         num_experts = layer.w13_weight_packed.shape[0]
@@ -754,15 +754,30 @@ class CompressedTensorsWNA16MarlinMoEMethod(CompressedTensorsMoEMethod):
         # LFRU beats plain LRU for deep-layer hit rate: prior art reports
         # 0-8% (LRU) -> 52-94% (LFRU) on GPT-OSS-20B; MiniMax's 256 experts
         # per layer make the delta larger.
+        # 3-tier cache: GPU (LFRU) -> pinned RAM (LRU) -> disk-backed mmap
+        # The RAM tier is sized from the env var VLLM_MOE_RAM_TIER_SIZE
+        # (default 0 = no RAM tier, behaves like flat LFRU).  When set,
+        # GPU misses first check the RAM tier before paying the disk
+        # re-read cost, which is much faster than the OS page-cache path
+        # because RAM -> GPU uses pinned DMA.
         capacity = min(layer._moe_expert_cache_size, num_experts)
-        layer.expert_weight_provider = LFRUCachedWeightProvider(
+        ram_capacity = int(os.environ.get("VLLM_MOE_RAM_TIER_SIZE", "0"))
+        ram_capacity = min(ram_capacity, num_experts)
+        layer.expert_weight_provider = TieredCachedWeightProvider(
             capacity=capacity,
             w13_weight=layer.w13_weight_packed.data,
             w2_weight=layer.w2_weight_packed.data,
             w13_scale=layer.w13_weight_scale.data,
             w2_scale=layer.w2_weight_scale.data,
             allow_non_pinned_cpu=True,
+            ram_capacity=ram_capacity,
         )
+        if ram_capacity > 0:
+            logger.info_once(
+                "CT WNA16 Marlin tiered cache: GPU %d + RAM %d + disk (of %d experts)",
+                capacity, ram_capacity, num_experts,
+                scope="local",
+            )
 
         # Do NOT zero out layer.w13_weight_packed.data here: the disk-backed
         # views we just assigned ARE the storage the provider references,
