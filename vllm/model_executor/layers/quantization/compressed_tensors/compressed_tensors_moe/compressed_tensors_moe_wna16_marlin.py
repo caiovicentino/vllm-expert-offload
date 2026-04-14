@@ -205,6 +205,10 @@ class CompressedTensorsWNA16MarlinMoEMethod(CompressedTensorsMoEMethod):
             and getattr(layer, "_moe_expert_cache_size", 0) > 0
         )
         self._cache_active_hint = use_cpu_pinned
+        # Mark the layer so process_weights_after_loading can detect cache
+        # even after device_loading_context temporarily moves tensors to GPU.
+        if use_cpu_pinned:
+            layer._ctmoe_cache_active = True
 
         # DEBUG: track per-layer allocations
         if use_cpu_pinned:
@@ -242,6 +246,12 @@ class CompressedTensorsWNA16MarlinMoEMethod(CompressedTensorsMoEMethod):
         )
         _layer_name = getattr(layer, "layer_name", f"layer_{id(layer)}")
         _safe_name = _layer_name.replace("/", "_").replace(".", "_")
+
+        # Paths used later by _process_weights_after_loading_offloaded
+        # to re-open the disk-backed files after device_loading_context
+        # has moved their data to GPU for the repack.
+        layer._ctmoe_cache_dir = _cache_dir
+        layer._ctmoe_safe_name = _safe_name
 
         def _disk_backed(shape, dtype, name):
             numel = 1
@@ -437,12 +447,27 @@ class CompressedTensorsWNA16MarlinMoEMethod(CompressedTensorsMoEMethod):
         num_experts = layer.w13_weight_g_idx.shape[0]
         device = layer.w13_weight_g_idx.device
 
-        # Fast path: cache active → Marlin repack on GPU scratch, results
-        # back in CPU pinned, then wire up the CachedWeightProvider.
+        # Fast path: cache active → Marlin repack on GPU, write results back
+        # to the disk-backed file, wire up the LFRU CachedWeightProvider.
+        #
+        # We check the LAYER flag set in create_weights (not the current
+        # tensor device) because vLLM's device_loading_context temporarily
+        # moves CPU parameters to GPU before calling this hook. The tensor
+        # device is therefore cuda here even though the backing was disk.
         cache_active = (
             self.supports_expert_lru_cache
             and getattr(layer, "_moe_expert_cache_size", 0) > 0
-            and layer.w13_weight_packed.device.type == "cpu"
+            and getattr(layer, "_ctmoe_cache_active", False)
+        )
+        logger.warning(
+            "[CTMOE pwl] layer=%s cache_active=%s supports=%s cache_size=%s "
+            "layer_flag=%s w13_device=%s",
+            getattr(layer, "layer_name", "?"),
+            cache_active,
+            self.supports_expert_lru_cache,
+            getattr(layer, "_moe_expert_cache_size", 0),
+            getattr(layer, "_ctmoe_cache_active", False),
+            layer.w13_weight_packed.data.device,
         )
         if cache_active:
             self._process_weights_after_loading_offloaded(layer)
@@ -585,15 +610,18 @@ class CompressedTensorsWNA16MarlinMoEMethod(CompressedTensorsMoEMethod):
     def _process_weights_after_loading_offloaded(
         self, layer: torch.nn.Module
     ) -> None:
-        """Run Marlin repack on CPU-pinned weights via a small GPU scratch,
-        REUSING the original pinned storage in-place (via resize_) so we
-        never hold both the pre- and post-repack buffers at the same time.
+        """Run Marlin repack on GPU and write the repacked results back
+        to disk-backed files via torch.from_file(shared=True).
 
-        Without this in-place reuse the peak host memory is
-            N_layers * (original + repacked) = 2x the backing store
-        which OOM-kills on workstation-class hosts (176 GB) for 200B+ MoE.
-        Both gptq_marlin_moe_repack and marlin_moe_permute_scales preserve
-        element count, so the same storage can hold either layout.
+        This is called when the expert LRU cache is active.  By the time
+        this hook runs, vLLM's device_loading_context has already moved
+        the (originally CPU disk-backed) parameters to GPU for processing.
+        We therefore cannot reuse the original storage in place; instead
+        we re-open the same files via torch.from_file and copy the GPU
+        Marlin-repacked data back to them.  Net result: the layer
+        parameters end up pointing at disk-backed mmap views, the pinned
+        memory footprint stays at zero, and the LFRU provider reads from
+        the OS page cache.
         """
         from vllm.model_executor.layers.fused_moe.expert_weight_provider import (
             LFRUCachedWeightProvider,
@@ -601,18 +629,35 @@ class CompressedTensorsWNA16MarlinMoEMethod(CompressedTensorsMoEMethod):
 
         num_experts = layer.w13_weight_packed.shape[0]
         gpu = torch.accelerator.current_accelerator()
-        assert gpu is not None, (
-            "expert offload requires an accelerator to run marlin repack"
-        )
+        if gpu is None or gpu.type == "cpu":
+            gpu = torch.device("cuda", torch.cuda.current_device())
+
+        cache_dir = layer._ctmoe_cache_dir
+        safe_name = layer._ctmoe_safe_name
 
         empty_sort = torch.empty(
             (num_experts, 0), dtype=torch.int32, device=gpu
         )
 
-        def _repack_inplace(param_data: torch.Tensor, size_k: int, size_n: int):
-            """Run the Marlin packed-weight repack keeping the backing
-            storage of ``param_data`` intact.  Transient GPU memory is one
-            layer worth (~1-2 GB on MiniMax-scale MoE)."""
+        def _to_disk_backed(
+            tensor_on_gpu: torch.Tensor, tag: str
+        ) -> torch.Tensor:
+            """Write a GPU tensor to a disk-backed file and return a
+            view of the file with the tensor's shape."""
+            path = f"{cache_dir}/{safe_name}_{tag}.bin"
+            numel = tensor_on_gpu.numel()
+            disk = torch.from_file(
+                path, shared=True, size=numel, dtype=tensor_on_gpu.dtype
+            )
+            disk_view = disk.view(*tensor_on_gpu.shape)
+            disk_view.copy_(tensor_on_gpu.cpu(), non_blocking=False)
+            return disk_view
+
+        def _repack_to_disk(
+            param_data: torch.Tensor, tag: str, size_k: int, size_n: int
+        ) -> torch.Tensor:
+            """Run Marlin repack on GPU and land the result in a
+            disk-backed file."""
             gpu_input = param_data.to(gpu, non_blocking=True)
             marlin_out = ops.gptq_marlin_moe_repack(
                 gpu_input,
@@ -623,17 +668,15 @@ class CompressedTensorsWNA16MarlinMoEMethod(CompressedTensorsMoEMethod):
                 is_a_8bit=False,
             )
             del gpu_input
-            # resize_ keeps the same storage because the element count is
-            # preserved by Marlin's repack (E, K/8, N) -> (E, K/16, N*2).
-            param_data.resize_(marlin_out.shape)
-            param_data.copy_(marlin_out, non_blocking=False)
+            disk_view = _to_disk_backed(marlin_out, tag)
             del marlin_out
+            return disk_view
 
-        def _permute_scales_inplace(
-            param_data: torch.Tensor, size_k: int, size_n: int
-        ):
-            """marlin_moe_permute_scales preserves shape exactly; just
-            copy back into the existing pinned buffer."""
+        def _permute_scales_to_disk(
+            param_data: torch.Tensor, tag: str, size_k: int, size_n: int
+        ) -> torch.Tensor:
+            """Run Marlin scale permute on GPU and land the result in a
+            disk-backed file."""
             gpu_scale = param_data.to(gpu, non_blocking=True)
             permuted = marlin_moe_permute_scales(
                 s=gpu_scale,
@@ -643,34 +686,43 @@ class CompressedTensorsWNA16MarlinMoEMethod(CompressedTensorsMoEMethod):
                 is_a_8bit=False,
             )
             del gpu_scale
-            param_data.copy_(permuted, non_blocking=False)
+            disk_view = _to_disk_backed(permuted, tag)
             del permuted
+            return disk_view
 
         # w13 packed: size_k = hidden_size, size_n = 2 * intermediate
-        _repack_inplace(
-            layer.w13_weight_packed.data,
-            size_k=layer.w13_weight_packed.data.shape[1] * self.packed_factor,
-            size_n=layer.w13_weight_packed.data.shape[2],
+        w13_size_k = layer.w13_weight_packed.data.shape[1] * self.packed_factor
+        w13_size_n = layer.w13_weight_packed.data.shape[2]
+        w13_disk = _repack_to_disk(
+            layer.w13_weight_packed.data, "w13_packed_marlin",
+            size_k=w13_size_k, size_n=w13_size_n,
         )
+        layer.w13_weight_packed.data = w13_disk
+
         # w2 packed: size_k = intermediate, size_n = hidden_size
-        _repack_inplace(
-            layer.w2_weight_packed.data,
-            size_k=layer.w2_weight_packed.data.shape[1] * self.packed_factor,
-            size_n=layer.w2_weight_packed.data.shape[2],
+        w2_size_k = layer.w2_weight_packed.data.shape[1] * self.packed_factor
+        w2_size_n = layer.w2_weight_packed.data.shape[2]
+        w2_disk = _repack_to_disk(
+            layer.w2_weight_packed.data, "w2_packed_marlin",
+            size_k=w2_size_k, size_n=w2_size_n,
         )
+        layer.w2_weight_packed.data = w2_disk
 
         # Scales: same element count, same shape, just permuted in place
-        _permute_scales_inplace(
-            layer.w13_weight_scale.data,
-            size_k=layer.w13_weight_packed.data.shape[1] * self.packed_factor,
+        w13_scale_disk = _permute_scales_to_disk(
+            layer.w13_weight_scale.data, "w13_scale_marlin",
+            size_k=w13_size_k,
             size_n=layer.w13_weight_scale.data.shape[2],
         )
-        _permute_scales_inplace(
-            layer.w2_weight_scale.data,
+        layer.w13_weight_scale.data = w13_scale_disk
+
+        w2_scale_disk = _permute_scales_to_disk(
+            layer.w2_weight_scale.data, "w2_scale_marlin",
             size_k=layer.w2_weight_scale.data.shape[1]
             * (self.group_size if self.group_size != -1 else self.packed_factor),
             size_n=layer.w2_weight_scale.data.shape[2],
         )
+        layer.w2_weight_scale.data = w2_scale_disk
 
         # Empty g_idx / sort_indices on GPU (non-actorder path)
         empty_gpu = torch.empty((num_experts, 0), dtype=torch.int32, device=gpu)
@@ -706,12 +758,11 @@ class CompressedTensorsWNA16MarlinMoEMethod(CompressedTensorsMoEMethod):
             allow_non_pinned_cpu=True,
         )
 
-        # Release parameter bindings.  The provider took direct refs to
-        # the underlying pinned tensors, so their storage stays alive.
-        layer.w13_weight_packed.data = torch.empty(0)
-        layer.w2_weight_packed.data = torch.empty(0)
-        layer.w13_weight_scale.data = torch.empty(0)
-        layer.w2_weight_scale.data = torch.empty(0)
+        # Do NOT zero out layer.w13_weight_packed.data here: the disk-backed
+        # views we just assigned ARE the storage the provider references,
+        # and vLLM's device_loading_context finally-block will call
+        # `p.data = p.data.to("cpu")` which is a no-op on already-CPU
+        # tensors (preserves the disk-backed mmap view).
 
         logger.info_once(
             "CT WNA16 Marlin expert LFRU cache: %d/%d experts cached on %s",
