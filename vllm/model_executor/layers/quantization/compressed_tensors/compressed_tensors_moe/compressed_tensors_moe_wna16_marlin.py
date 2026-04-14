@@ -223,9 +223,14 @@ class CompressedTensorsWNA16MarlinMoEMethod(CompressedTensorsMoEMethod):
 
         def _empty_packed(shape):
             if use_cpu_pinned:
+                # pin_memory=True kwarg allocates DIRECTLY in pinned memory
+                # (no intermediate non-pinned tensor). The old
+                # torch.empty(...).pin_memory() pattern creates a
+                # non-pinned source, then a pinned copy, leaving the
+                # source alive until Python GC — doubling peak memory.
                 return torch.empty(
-                    *shape, dtype=torch.int32, device="cpu"
-                ).pin_memory()
+                    *shape, dtype=torch.int32, device="cpu", pin_memory=True
+                )
             return torch.empty(*shape, dtype=torch.int32)
 
         w13_weight = torch.nn.Parameter(
@@ -279,9 +284,13 @@ class CompressedTensorsWNA16MarlinMoEMethod(CompressedTensorsMoEMethod):
 
         def _ones_scale(shape):
             if use_cpu_pinned:
-                return torch.ones(
-                    *shape, dtype=params_dtype, device="cpu"
-                ).pin_memory()
+                # Same direct-pinned allocation as _empty_packed, then
+                # fill with 1.0 in place.
+                t = torch.empty(
+                    *shape, dtype=params_dtype, device="cpu", pin_memory=True
+                )
+                t.fill_(1.0)
+                return t
             return torch.ones(*shape, dtype=params_dtype)
 
         w13_scale = torch.nn.Parameter(
