@@ -557,6 +557,46 @@ class TieredCachedWeightProvider(LFRUCachedWeightProvider):
         """
         self._hf_cold_reader = reader
 
+    def prepopulate_ram_tier(self, num_experts: int) -> int:
+        """Fill the RAM tier with every expert from the current cold source.
+
+        Used by process_weights_after_loading to eagerly move all experts
+        from the transient disk-backed cold tier into pinned RAM, so that
+        the disk-backed files can be deleted immediately afterwards.
+
+        Returns the number of experts actually copied.  If
+        ``ram_capacity`` is smaller than ``num_experts`` we copy up to
+        ``ram_capacity`` experts and leave the rest on the cold tier.
+        """
+        if self.ram_capacity == 0:
+            return 0
+        n = min(num_experts, self.ram_capacity)
+        for eid in range(n):
+            if eid in self._ram_lru:
+                continue
+            slot = self._acquire_ram_slot()
+            self._copy_cold_to_ram(slot, eid)
+            self._ram_lru[eid] = slot
+        return n
+
+    def drop_cold_tensors(self) -> None:
+        """Release the CPU-side cold-tier references.
+
+        Call this after :meth:`prepopulate_ram_tier` has fully populated
+        the RAM tier (ram_capacity >= num_experts) and the caller has
+        removed the disk-backed files.  The provider becomes fully
+        RAM-backed from this point on.
+        """
+        self._cpu_w13 = torch.empty(0, dtype=self._cpu_w13.dtype)
+        self._cpu_w2 = torch.empty(0, dtype=self._cpu_w2.dtype)
+        if self._cpu_w13_scale is not None:
+            self._cpu_w13_scale = torch.empty(
+                0, dtype=self._cpu_w13_scale.dtype
+            )
+            self._cpu_w2_scale = torch.empty(
+                0, dtype=self._cpu_w2_scale.dtype
+            )
+
     def _acquire_ram_slot(self) -> int:
         """Return a RAM tier slot index, evicting the LRU entry if full."""
         if self._ram_free_slots:
