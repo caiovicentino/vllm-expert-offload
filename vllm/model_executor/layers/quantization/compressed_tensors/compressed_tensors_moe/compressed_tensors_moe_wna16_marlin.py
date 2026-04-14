@@ -512,12 +512,18 @@ class CompressedTensorsWNA16MarlinMoEMethod(CompressedTensorsMoEMethod):
     def _process_weights_after_loading_offloaded(
         self, layer: torch.nn.Module
     ) -> None:
-        """Run Marlin repack on CPU-pinned weights via a GPU scratch copy,
-        then instantiate the CachedWeightProvider and release the full CPU
-        tensors from the layer parameters (the provider keeps its own refs).
+        """Run Marlin repack on CPU-pinned weights via a small GPU scratch,
+        REUSING the original pinned storage in-place (via resize_) so we
+        never hold both the pre- and post-repack buffers at the same time.
+
+        Without this in-place reuse the peak host memory is
+            N_layers * (original + repacked) = 2x the backing store
+        which OOM-kills on workstation-class hosts (176 GB) for 200B+ MoE.
+        Both gptq_marlin_moe_repack and marlin_moe_permute_scales preserve
+        element count, so the same storage can hold either layout.
         """
         from vllm.model_executor.layers.fused_moe.expert_weight_provider import (
-            CachedWeightProvider,
+            LFRUCachedWeightProvider,
         )
 
         num_experts = layer.w13_weight_packed.shape[0]
@@ -526,83 +532,74 @@ class CompressedTensorsWNA16MarlinMoEMethod(CompressedTensorsMoEMethod):
             "expert offload requires an accelerator to run marlin repack"
         )
 
-        # Empty g_idx + sort_indices on GPU (non-actorder path)
-        empty_g_idx = torch.empty(
-            (num_experts, 0), dtype=torch.int32, device=gpu
-        )
         empty_sort = torch.empty(
             (num_experts, 0), dtype=torch.int32, device=gpu
         )
 
-        # Stage packed weights on GPU, repack, copy back to CPU pinned.
-        # The full-expert repack is the simplest correct path; memory is
-        # bounded to one layer's worth (~5-10 GB on MiniMax-scale MoE).
-        w13_gpu = layer.w13_weight_packed.data.to(gpu, non_blocking=True)
-        w2_gpu = layer.w2_weight_packed.data.to(gpu, non_blocking=True)
+        def _repack_inplace(param_data: torch.Tensor, size_k: int, size_n: int):
+            """Run the Marlin packed-weight repack keeping the backing
+            storage of ``param_data`` intact.  Transient GPU memory is one
+            layer worth (~1-2 GB on MiniMax-scale MoE)."""
+            gpu_input = param_data.to(gpu, non_blocking=True)
+            marlin_out = ops.gptq_marlin_moe_repack(
+                gpu_input,
+                empty_sort,
+                size_k,
+                size_n,
+                self.num_bits,
+                is_a_8bit=False,
+            )
+            del gpu_input
+            # resize_ keeps the same storage because the element count is
+            # preserved by Marlin's repack (E, K/8, N) -> (E, K/16, N*2).
+            param_data.resize_(marlin_out.shape)
+            param_data.copy_(marlin_out, non_blocking=False)
+            del marlin_out
 
-        marlin_w13 = ops.gptq_marlin_moe_repack(
-            w13_gpu,
-            empty_sort,
-            w13_gpu.shape[1] * self.packed_factor,
-            w13_gpu.shape[2],
-            self.num_bits,
-            is_a_8bit=False,
+        def _permute_scales_inplace(
+            param_data: torch.Tensor, size_k: int, size_n: int
+        ):
+            """marlin_moe_permute_scales preserves shape exactly; just
+            copy back into the existing pinned buffer."""
+            gpu_scale = param_data.to(gpu, non_blocking=True)
+            permuted = marlin_moe_permute_scales(
+                s=gpu_scale,
+                size_k=size_k,
+                size_n=size_n,
+                group_size=self.group_size,
+                is_a_8bit=False,
+            )
+            del gpu_scale
+            param_data.copy_(permuted, non_blocking=False)
+            del permuted
+
+        # w13 packed: size_k = hidden_size, size_n = 2 * intermediate
+        _repack_inplace(
+            layer.w13_weight_packed.data,
+            size_k=layer.w13_weight_packed.data.shape[1] * self.packed_factor,
+            size_n=layer.w13_weight_packed.data.shape[2],
         )
-        marlin_w2 = ops.gptq_marlin_moe_repack(
-            w2_gpu,
-            empty_sort,
-            w2_gpu.shape[1] * self.packed_factor,
-            w2_gpu.shape[2],
-            self.num_bits,
-            is_a_8bit=False,
+        # w2 packed: size_k = intermediate, size_n = hidden_size
+        _repack_inplace(
+            layer.w2_weight_packed.data,
+            size_k=layer.w2_weight_packed.data.shape[1] * self.packed_factor,
+            size_n=layer.w2_weight_packed.data.shape[2],
         )
 
-        # Move repacked to CPU pinned (where the cache provider wants them)
-        marlin_w13_cpu = torch.empty(
-            marlin_w13.shape, dtype=marlin_w13.dtype, device="cpu"
-        ).pin_memory()
-        marlin_w13_cpu.copy_(marlin_w13, non_blocking=False)
-        marlin_w2_cpu = torch.empty(
-            marlin_w2.shape, dtype=marlin_w2.dtype, device="cpu"
-        ).pin_memory()
-        marlin_w2_cpu.copy_(marlin_w2, non_blocking=False)
-        del w13_gpu, w2_gpu, marlin_w13, marlin_w2
-
-        # Stage scales on GPU for permute, then back to CPU pinned
-        w13_scale_gpu = layer.w13_weight_scale.data.to(gpu, non_blocking=True)
-        w2_scale_gpu = layer.w2_weight_scale.data.to(gpu, non_blocking=True)
-
-        marlin_w13_scales = marlin_moe_permute_scales(
-            s=w13_scale_gpu,
-            size_k=layer.w13_weight_packed.shape[1] * self.packed_factor,
-            size_n=w13_scale_gpu.shape[2],
-            group_size=self.group_size,
-            is_a_8bit=False,
+        # Scales: same element count, same shape, just permuted in place
+        _permute_scales_inplace(
+            layer.w13_weight_scale.data,
+            size_k=layer.w13_weight_packed.data.shape[1] * self.packed_factor,
+            size_n=layer.w13_weight_scale.data.shape[2],
         )
-        marlin_w2_scales = marlin_moe_permute_scales(
-            s=w2_scale_gpu,
-            size_k=w2_scale_gpu.shape[1]
+        _permute_scales_inplace(
+            layer.w2_weight_scale.data,
+            size_k=layer.w2_weight_scale.data.shape[1]
             * (self.group_size if self.group_size != -1 else self.packed_factor),
-            size_n=w2_scale_gpu.shape[2],
-            group_size=self.group_size,
-            is_a_8bit=False,
+            size_n=layer.w2_weight_scale.data.shape[2],
         )
 
-        marlin_w13_scales_cpu = torch.empty(
-            marlin_w13_scales.shape,
-            dtype=marlin_w13_scales.dtype,
-            device="cpu",
-        ).pin_memory()
-        marlin_w13_scales_cpu.copy_(marlin_w13_scales, non_blocking=False)
-        marlin_w2_scales_cpu = torch.empty(
-            marlin_w2_scales.shape,
-            dtype=marlin_w2_scales.dtype,
-            device="cpu",
-        ).pin_memory()
-        marlin_w2_scales_cpu.copy_(marlin_w2_scales, non_blocking=False)
-        del w13_scale_gpu, w2_scale_gpu, marlin_w13_scales, marlin_w2_scales
-
-        # Empty g_idx / sort_indices on GPU (non-actorder)
+        # Empty g_idx / sort_indices on GPU (non-actorder path)
         empty_gpu = torch.empty((num_experts, 0), dtype=torch.int32, device=gpu)
         layer.w13_weight_g_idx = torch.nn.Parameter(
             empty_gpu.clone(), requires_grad=False
@@ -620,26 +617,30 @@ class CompressedTensorsWNA16MarlinMoEMethod(CompressedTensorsMoEMethod):
         # Marlin workspace (small, stays on GPU)
         layer.workspace = marlin_make_workspace_new(gpu, 4)
 
-        # Instantiate the cache provider directly (bypasses
+        # Instantiate the LFRU cache provider directly (bypasses
         # layer._maybe_init_expert_lru_cache which hard-codes w13_weight /
         # w2_weight names and a 1-D scale check that our 3-D scales fail).
+        # LFRU beats plain LRU for deep-layer hit rate: prior art reports
+        # 0-8% (LRU) -> 52-94% (LFRU) on GPT-OSS-20B; MiniMax's 256 experts
+        # per layer make the delta larger.
         capacity = min(layer._moe_expert_cache_size, num_experts)
-        layer.expert_weight_provider = CachedWeightProvider(
+        layer.expert_weight_provider = LFRUCachedWeightProvider(
             capacity=capacity,
-            w13_weight=marlin_w13_cpu,
-            w2_weight=marlin_w2_cpu,
-            w13_scale=marlin_w13_scales_cpu,
-            w2_scale=marlin_w2_scales_cpu,
+            w13_weight=layer.w13_weight_packed.data,
+            w2_weight=layer.w2_weight_packed.data,
+            w13_scale=layer.w13_weight_scale.data,
+            w2_scale=layer.w2_weight_scale.data,
         )
 
-        # Release full tensors from layer parameters (provider holds refs)
+        # Release parameter bindings.  The provider took direct refs to
+        # the underlying pinned tensors, so their storage stays alive.
         layer.w13_weight_packed.data = torch.empty(0)
         layer.w2_weight_packed.data = torch.empty(0)
         layer.w13_weight_scale.data = torch.empty(0)
         layer.w2_weight_scale.data = torch.empty(0)
 
         logger.info_once(
-            "CT WNA16 Marlin expert LRU cache: %d/%d experts cached on %s",
+            "CT WNA16 Marlin expert LFRU cache: %d/%d experts cached on %s",
             capacity,
             num_experts,
             gpu,
