@@ -89,6 +89,24 @@ class CompressedTensorsWNA16MarlinMoEMethod(CompressedTensorsMoEMethod):
             f"(group_size={self.group_size}, num_bits={self.num_bits})",
             scope="local",
         )
+        # Set in create_weights after we know the layer's expert cache size.
+        # Read by maybe_make_prepare_finalize to short-circuit the modular
+        # kernel wrap path when the expert LRU cache is active.
+        self._cache_active_hint: bool = False
+
+    @property
+    def supports_expert_lru_cache(self) -> bool:
+        # Cache path is only wired up for the Marlin backend (non-Flashinfer)
+        # and for the non-actorder + non-8bit-input variants.  Those are the
+        # common config for compressed-tensors INT4 pack-quantized MoE.
+        return (
+            self.kernel_backend == "Marlin"
+            and not self.actorder
+            and (
+                self.marlin_input_dtype is None
+                or self.marlin_input_dtype.itemsize != 1
+            )
+        )
 
     def get_weight_shape(
         self,
@@ -177,15 +195,32 @@ class CompressedTensorsWNA16MarlinMoEMethod(CompressedTensorsMoEMethod):
             {"is_transposed": is_transposed, "quant_method": self.strategy}
         )
 
+        # Expert LRU cache: allocate big per-expert tensors in CPU pinned
+        # memory so that checkpoint loading never allocates GPU memory for
+        # them.  Process_weights_after_loading then does a per-chunk Marlin
+        # repack on a small GPU scratch buffer and initializes the provider.
+        # See supports_expert_lru_cache for the supported config subset.
+        use_cpu_pinned = (
+            self.supports_expert_lru_cache
+            and getattr(layer, "_moe_expert_cache_size", 0) > 0
+        )
+        self._cache_active_hint = use_cpu_pinned
+
+        def _empty_packed(shape):
+            if use_cpu_pinned:
+                return torch.empty(
+                    *shape, dtype=torch.int32, device="cpu"
+                ).pin_memory()
+            return torch.empty(*shape, dtype=torch.int32)
+
         w13_weight = torch.nn.Parameter(
-            torch.empty(
-                *self.get_weight_shape(
+            _empty_packed(
+                self.get_weight_shape(
                     "w13_weight",
                     num_experts,
                     hidden_size,
                     intermediate_size_per_partition,
-                ),
-                dtype=torch.int32,
+                )
             ),
             requires_grad=False,
         )
@@ -193,14 +228,13 @@ class CompressedTensorsWNA16MarlinMoEMethod(CompressedTensorsMoEMethod):
         set_weight_attrs(w13_weight, extra_weight_attrs)
 
         w2_weight = torch.nn.Parameter(
-            torch.empty(
-                *self.get_weight_shape(
+            _empty_packed(
+                self.get_weight_shape(
                     "w2_weight",
                     num_experts,
                     hidden_size,
                     intermediate_size_per_partition,
-                ),
-                dtype=torch.int32,
+                )
             ),
             requires_grad=False,
         )
@@ -228,16 +262,22 @@ class CompressedTensorsWNA16MarlinMoEMethod(CompressedTensorsMoEMethod):
         layer.num_groups_w13 = num_groups_w13
         layer.num_groups_w2 = num_groups_w2
 
+        def _ones_scale(shape):
+            if use_cpu_pinned:
+                return torch.ones(
+                    *shape, dtype=params_dtype, device="cpu"
+                ).pin_memory()
+            return torch.ones(*shape, dtype=params_dtype)
+
         w13_scale = torch.nn.Parameter(
-            torch.ones(
-                *self.get_weight_shape(
+            _ones_scale(
+                self.get_weight_shape(
                     "w13_scale",
                     num_experts,
                     hidden_size,
                     intermediate_size_per_partition,
                     num_groups_w13=num_groups_w13,
-                ),
-                dtype=params_dtype,
+                )
             ),
             requires_grad=False,
         )
@@ -245,15 +285,14 @@ class CompressedTensorsWNA16MarlinMoEMethod(CompressedTensorsMoEMethod):
         set_weight_attrs(w13_scale, extra_weight_attrs)
 
         w2_scale = torch.nn.Parameter(
-            torch.ones(
-                *self.get_weight_shape(
+            _ones_scale(
+                self.get_weight_shape(
                     "w2_scale",
                     num_experts,
                     hidden_size,
                     intermediate_size_per_partition,
                     num_groups_w2=num_groups_w2,
-                ),
-                dtype=params_dtype,
+                )
             ),
             requires_grad=False,
         )
@@ -324,6 +363,18 @@ class CompressedTensorsWNA16MarlinMoEMethod(CompressedTensorsMoEMethod):
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         num_experts = layer.w13_weight_g_idx.shape[0]
         device = layer.w13_weight_g_idx.device
+
+        # Fast path: cache active → Marlin repack on GPU scratch, results
+        # back in CPU pinned, then wire up the CachedWeightProvider.
+        cache_active = (
+            self.supports_expert_lru_cache
+            and getattr(layer, "_moe_expert_cache_size", 0) > 0
+            and layer.w13_weight_packed.device.type == "cpu"
+        )
+        if cache_active:
+            self._process_weights_after_loading_offloaded(layer)
+            return
+
         if self.kernel_backend == "Flashinfer":
             dict_weights_mxint4 = prepare_static_weights_for_trtllm_mxint4_moe(
                 layer.w13_weight_packed,
@@ -458,6 +509,156 @@ class CompressedTensorsWNA16MarlinMoEMethod(CompressedTensorsMoEMethod):
 
         layer.workspace = marlin_make_workspace_new(device, 4)
 
+    def _process_weights_after_loading_offloaded(
+        self, layer: torch.nn.Module
+    ) -> None:
+        """Run Marlin repack on CPU-pinned weights via a GPU scratch copy,
+        then instantiate the CachedWeightProvider and release the full CPU
+        tensors from the layer parameters (the provider keeps its own refs).
+        """
+        from vllm.model_executor.layers.fused_moe.expert_weight_provider import (
+            CachedWeightProvider,
+        )
+
+        num_experts = layer.w13_weight_packed.shape[0]
+        gpu = torch.accelerator.current_accelerator()
+        assert gpu is not None, (
+            "expert offload requires an accelerator to run marlin repack"
+        )
+
+        # Empty g_idx + sort_indices on GPU (non-actorder path)
+        empty_g_idx = torch.empty(
+            (num_experts, 0), dtype=torch.int32, device=gpu
+        )
+        empty_sort = torch.empty(
+            (num_experts, 0), dtype=torch.int32, device=gpu
+        )
+
+        # Stage packed weights on GPU, repack, copy back to CPU pinned.
+        # The full-expert repack is the simplest correct path; memory is
+        # bounded to one layer's worth (~5-10 GB on MiniMax-scale MoE).
+        w13_gpu = layer.w13_weight_packed.data.to(gpu, non_blocking=True)
+        w2_gpu = layer.w2_weight_packed.data.to(gpu, non_blocking=True)
+
+        marlin_w13 = ops.gptq_marlin_moe_repack(
+            w13_gpu,
+            empty_sort,
+            w13_gpu.shape[1] * self.packed_factor,
+            w13_gpu.shape[2],
+            self.num_bits,
+            is_a_8bit=False,
+        )
+        marlin_w2 = ops.gptq_marlin_moe_repack(
+            w2_gpu,
+            empty_sort,
+            w2_gpu.shape[1] * self.packed_factor,
+            w2_gpu.shape[2],
+            self.num_bits,
+            is_a_8bit=False,
+        )
+
+        # Move repacked to CPU pinned (where the cache provider wants them)
+        marlin_w13_cpu = torch.empty(
+            marlin_w13.shape, dtype=marlin_w13.dtype, device="cpu"
+        ).pin_memory()
+        marlin_w13_cpu.copy_(marlin_w13, non_blocking=False)
+        marlin_w2_cpu = torch.empty(
+            marlin_w2.shape, dtype=marlin_w2.dtype, device="cpu"
+        ).pin_memory()
+        marlin_w2_cpu.copy_(marlin_w2, non_blocking=False)
+        del w13_gpu, w2_gpu, marlin_w13, marlin_w2
+
+        # Stage scales on GPU for permute, then back to CPU pinned
+        w13_scale_gpu = layer.w13_weight_scale.data.to(gpu, non_blocking=True)
+        w2_scale_gpu = layer.w2_weight_scale.data.to(gpu, non_blocking=True)
+
+        marlin_w13_scales = marlin_moe_permute_scales(
+            s=w13_scale_gpu,
+            size_k=layer.w13_weight_packed.shape[1] * self.packed_factor,
+            size_n=w13_scale_gpu.shape[2],
+            group_size=self.group_size,
+            is_a_8bit=False,
+        )
+        marlin_w2_scales = marlin_moe_permute_scales(
+            s=w2_scale_gpu,
+            size_k=w2_scale_gpu.shape[1]
+            * (self.group_size if self.group_size != -1 else self.packed_factor),
+            size_n=w2_scale_gpu.shape[2],
+            group_size=self.group_size,
+            is_a_8bit=False,
+        )
+
+        marlin_w13_scales_cpu = torch.empty(
+            marlin_w13_scales.shape,
+            dtype=marlin_w13_scales.dtype,
+            device="cpu",
+        ).pin_memory()
+        marlin_w13_scales_cpu.copy_(marlin_w13_scales, non_blocking=False)
+        marlin_w2_scales_cpu = torch.empty(
+            marlin_w2_scales.shape,
+            dtype=marlin_w2_scales.dtype,
+            device="cpu",
+        ).pin_memory()
+        marlin_w2_scales_cpu.copy_(marlin_w2_scales, non_blocking=False)
+        del w13_scale_gpu, w2_scale_gpu, marlin_w13_scales, marlin_w2_scales
+
+        # Empty g_idx / sort_indices on GPU (non-actorder)
+        empty_gpu = torch.empty((num_experts, 0), dtype=torch.int32, device=gpu)
+        layer.w13_weight_g_idx = torch.nn.Parameter(
+            empty_gpu.clone(), requires_grad=False
+        )
+        layer.w2_weight_g_idx = torch.nn.Parameter(
+            empty_gpu.clone(), requires_grad=False
+        )
+        layer.w13_g_idx_sort_indices = torch.nn.Parameter(
+            empty_gpu.clone(), requires_grad=False
+        )
+        layer.w2_g_idx_sort_indices = torch.nn.Parameter(
+            empty_gpu.clone(), requires_grad=False
+        )
+
+        # Marlin workspace (small, stays on GPU)
+        layer.workspace = marlin_make_workspace_new(gpu, 4)
+
+        # Instantiate the cache provider directly (bypasses
+        # layer._maybe_init_expert_lru_cache which hard-codes w13_weight /
+        # w2_weight names and a 1-D scale check that our 3-D scales fail).
+        capacity = min(layer._moe_expert_cache_size, num_experts)
+        layer.expert_weight_provider = CachedWeightProvider(
+            capacity=capacity,
+            w13_weight=marlin_w13_cpu,
+            w2_weight=marlin_w2_cpu,
+            w13_scale=marlin_w13_scales_cpu,
+            w2_scale=marlin_w2_scales_cpu,
+        )
+
+        # Release full tensors from layer parameters (provider holds refs)
+        layer.w13_weight_packed.data = torch.empty(0)
+        layer.w2_weight_packed.data = torch.empty(0)
+        layer.w13_weight_scale.data = torch.empty(0)
+        layer.w2_weight_scale.data = torch.empty(0)
+
+        logger.info_once(
+            "CT WNA16 Marlin expert LRU cache: %d/%d experts cached on %s",
+            capacity,
+            num_experts,
+            gpu,
+        )
+
+    def maybe_make_prepare_finalize(
+        self,
+        routing_tables: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None,
+    ):
+        # When the expert LRU cache is active we serve MoE via the direct
+        # apply() override (which routes through the provider + Marlin).
+        # Returning None here prevents maybe_init_modular_kernel from
+        # wrapping us in FusedMoEModularMethod, which would otherwise call
+        # select_gemm_impl and crash because the packed weights have been
+        # released to empty(0) after cache init.
+        if self._cache_active_hint:
+            return None
+        return super().maybe_make_prepare_finalize(routing_tables)
+
     def get_fused_moe_quant_config(
         self, layer: torch.nn.Module
     ) -> FusedMoEQuantConfig | None:
@@ -477,6 +678,12 @@ class CompressedTensorsWNA16MarlinMoEMethod(CompressedTensorsMoEMethod):
         layer: torch.nn.Module,
     ) -> mk.FusedMoEExpertsModular:
         assert self.num_bits == 4, "only supporting w4"
+        if getattr(layer, "expert_weight_provider", None) is not None:
+            raise RuntimeError(
+                "CT WNA16 Marlin select_gemm_impl is not compatible with the "
+                "expert LRU cache. The cache path uses the direct apply() "
+                "override and should not go through the modular kernel."
+            )
         layer.w13_weight = layer.w13_weight_packed
         layer.w2_weight = layer.w2_weight_packed
         assert all([w is not None for w in [layer.w13_weight, layer.w2_weight]])
@@ -547,6 +754,40 @@ class CompressedTensorsWNA16MarlinMoEMethod(CompressedTensorsMoEMethod):
         shared_experts_input: torch.Tensor | None,
     ) -> torch.Tensor:
         assert self.kernel_backend == "Marlin"
+
+        provider = getattr(layer, "expert_weight_provider", None)
+        if provider is not None:
+            # Expert LRU cache path: provider streams the requested experts
+            # from CPU pinned into a small GPU scratch, returns buffer refs
+            # and slot-remapped topk_ids.
+            result = provider.prepare(topk_ids)
+            return fused_marlin_moe(
+                x,
+                result.w1,
+                result.w2,
+                None,
+                None,
+                result.w1_scale,
+                result.w2_scale,
+                topk_weights,
+                result.topk_ids,
+                input_global_scale1=None,
+                input_global_scale2=None,
+                quant_type_id=self.quant_type.id,
+                apply_router_weight_on_input=layer.apply_router_weight_on_input,
+                global_num_experts=provider.capacity,
+                activation=layer.activation,
+                expert_map=None,
+                g_idx1=layer.w13_weight_g_idx,
+                g_idx2=layer.w2_weight_g_idx,
+                sort_indices1=layer.w13_g_idx_sort_indices,
+                sort_indices2=layer.w2_g_idx_sort_indices,
+                workspace=layer.workspace,
+                input_dtype=self.marlin_input_dtype,
+                is_k_full=self.is_k_full,
+                inplace=not self.moe.disable_inplace,
+            )
+
         return fused_marlin_moe(
             x,
             layer.w13_weight_packed,
