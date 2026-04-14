@@ -206,6 +206,21 @@ class CompressedTensorsWNA16MarlinMoEMethod(CompressedTensorsMoEMethod):
         )
         self._cache_active_hint = use_cpu_pinned
 
+        # DEBUG: track per-layer allocations
+        if use_cpu_pinned:
+            import os
+            try:
+                with open('/proc/self/status') as _f:
+                    for _line in _f:
+                        if _line.startswith('VmRSS:') or _line.startswith('RssShmem:'):
+                            logger.warning(
+                                "[CTMOE alloc start] layer=%s %s",
+                                getattr(layer, 'layer_name', '?'),
+                                _line.strip(),
+                            )
+            except Exception:
+                pass
+
         def _empty_packed(shape):
             if use_cpu_pinned:
                 return torch.empty(
@@ -359,6 +374,24 @@ class CompressedTensorsWNA16MarlinMoEMethod(CompressedTensorsMoEMethod):
         layer.a13_scale = None
         layer.a2_scale = None
         layer.marlin_state = GPTQMarlinState.REPACK
+
+        # DEBUG: dump RSS after create_weights done for this layer
+        if use_cpu_pinned:
+            try:
+                with open('/proc/self/status') as _f:
+                    for _line in _f:
+                        if _line.startswith('VmRSS:') or _line.startswith('RssShmem:') or _line.startswith('RssAnon:'):
+                            logger.warning(
+                                "[CTMOE alloc end] layer=%s %s w13=%s w2=%s s13=%s s2=%s",
+                                getattr(layer, 'layer_name', '?'),
+                                _line.strip(),
+                                tuple(w13_weight.shape),
+                                tuple(w2_weight.shape),
+                                tuple(w13_scale.shape),
+                                tuple(w2_scale.shape),
+                            )
+            except Exception:
+                pass
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         num_experts = layer.w13_weight_g_idx.shape[0]
