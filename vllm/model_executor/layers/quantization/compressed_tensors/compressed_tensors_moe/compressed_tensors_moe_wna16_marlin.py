@@ -831,6 +831,26 @@ class CompressedTensorsWNA16MarlinMoEMethod(CompressedTensorsMoEMethod):
         assert self.kernel_backend == "Marlin"
 
         provider = getattr(layer, "expert_weight_provider", None)
+        # DEBUG: first call only
+        if not getattr(self, "_apply_logged", False):
+            self._apply_logged = True
+            logger.warning(
+                "[CTMOE apply] layer=%s provider=%s w13_packed.device=%s "
+                "w13_packed.shape=%s w13_packed.numel=%d",
+                getattr(layer, "layer_name", "?"),
+                "SET" if provider is not None else "NONE",
+                layer.w13_weight_packed.data.device,
+                tuple(layer.w13_weight_packed.data.shape),
+                layer.w13_weight_packed.data.numel(),
+            )
+            if provider is not None:
+                _r = provider.prepare(topk_ids)
+                logger.warning(
+                    "[CTMOE apply] provider result: w1.device=%s w1.shape=%s "
+                    "w2.device=%s topk_ids.device=%s",
+                    _r.w1.device, tuple(_r.w1.shape),
+                    _r.w2.device, _r.topk_ids.device,
+                )
         if provider is not None:
             # Expert LRU cache path: provider streams the requested experts
             # from CPU pinned into a small GPU scratch, returns buffer refs

@@ -96,7 +96,16 @@ class CachedWeightProvider(ExpertWeightProvider):
         self._last_log_time: float = 0.0
 
         if w13_weight.device.type == "cpu":
+            # Robust GPU device selection: torch.accelerator.current_accelerator()
+            # can return None in some contexts. Fall back to explicit cuda:0.
             cuda_device = torch.accelerator.current_accelerator()
+            if cuda_device is None or cuda_device.type == "cpu":
+                cuda_device = torch.device("cuda", torch.cuda.current_device())
+            logger.warning(
+                "CachedWeightProvider init: target GPU device=%s, "
+                "w13_weight.device=%s, allow_non_pinned_cpu=%s",
+                cuda_device, w13_weight.device, allow_non_pinned_cpu,
+            )
             if allow_non_pinned_cpu:
                 # Disk-backed (torch.from_file) or regular CPU tensors.
                 # Used for models whose full backing store exceeds host RAM;
