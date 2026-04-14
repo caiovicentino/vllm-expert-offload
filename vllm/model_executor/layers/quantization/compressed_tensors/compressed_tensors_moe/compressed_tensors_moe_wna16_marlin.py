@@ -690,11 +690,17 @@ class CompressedTensorsWNA16MarlinMoEMethod(CompressedTensorsMoEMethod):
             del permuted
             return disk_view
 
+        # Marlin repack and permute_scales both preserve element count, so
+        # we reuse the SAME disk-backed files from create_weights
+        # (overwriting their contents in place).  Without this reuse the
+        # patch would need 2x disk for the repacked copies -- ~240 GB for
+        # MiniMax-M2.7, which exceeds Colab's 235 GB overlay limit.
+
         # w13 packed: size_k = hidden_size, size_n = 2 * intermediate
         w13_size_k = layer.w13_weight_packed.data.shape[1] * self.packed_factor
         w13_size_n = layer.w13_weight_packed.data.shape[2]
         w13_disk = _repack_to_disk(
-            layer.w13_weight_packed.data, "w13_packed_marlin",
+            layer.w13_weight_packed.data, "w13_packed",
             size_k=w13_size_k, size_n=w13_size_n,
         )
         layer.w13_weight_packed.data = w13_disk
@@ -703,21 +709,21 @@ class CompressedTensorsWNA16MarlinMoEMethod(CompressedTensorsMoEMethod):
         w2_size_k = layer.w2_weight_packed.data.shape[1] * self.packed_factor
         w2_size_n = layer.w2_weight_packed.data.shape[2]
         w2_disk = _repack_to_disk(
-            layer.w2_weight_packed.data, "w2_packed_marlin",
+            layer.w2_weight_packed.data, "w2_packed",
             size_k=w2_size_k, size_n=w2_size_n,
         )
         layer.w2_weight_packed.data = w2_disk
 
         # Scales: same element count, same shape, just permuted in place
         w13_scale_disk = _permute_scales_to_disk(
-            layer.w13_weight_scale.data, "w13_scale_marlin",
+            layer.w13_weight_scale.data, "w13_scale",
             size_k=w13_size_k,
             size_n=layer.w13_weight_scale.data.shape[2],
         )
         layer.w13_weight_scale.data = w13_scale_disk
 
         w2_scale_disk = _permute_scales_to_disk(
-            layer.w2_weight_scale.data, "w2_scale_marlin",
+            layer.w2_weight_scale.data, "w2_scale",
             size_k=layer.w2_weight_scale.data.shape[1]
             * (self.group_size if self.group_size != -1 else self.packed_factor),
             size_n=layer.w2_weight_scale.data.shape[2],
