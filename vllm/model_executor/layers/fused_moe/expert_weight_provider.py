@@ -191,6 +191,90 @@ class CachedWeightProvider(ExpertWeightProvider):
             slot = self._lru.pop(expert_id)
             self._free_slots.append(slot)
 
+    def _prepare_overflow(
+        self, topk_ids: torch.Tensor, unique_ids: list[int]
+    ) -> ExpertWeightResult:
+        """One-shot path for when a single forward needs more unique experts
+        than fit in the persistent LRU cache.
+
+        Allocates a per-call GPU buffer big enough for all unique experts in
+        this forward, copies them from the CPU backing store, and returns a
+        fresh mapping.  The buffers are freed when this ExpertWeightResult
+        goes out of scope.
+
+        Slower than the LRU hit path (no reuse across forwards), but
+        correct.  The previous behaviour — truncating unique_ids to the last
+        ``capacity`` entries — silently produced garbage outputs for every
+        token whose chosen expert got dropped, because their mapping entries
+        pointed to stale slots from prior calls.
+        """
+        device = self._buf_w13.device
+        n_unique = len(unique_ids)
+
+        buf_w13 = torch.empty(
+            n_unique,
+            *self._cpu_w13.shape[1:],
+            dtype=self._cpu_w13.dtype,
+            device=device,
+        )
+        buf_w2 = torch.empty(
+            n_unique,
+            *self._cpu_w2.shape[1:],
+            dtype=self._cpu_w2.dtype,
+            device=device,
+        )
+        if self._cpu_w13_scale is not None:
+            buf_w13_scale = torch.empty(
+                n_unique,
+                *self._cpu_w13_scale.shape[1:],
+                dtype=self._cpu_w13_scale.dtype,
+                device=device,
+            )
+            buf_w2_scale = torch.empty(
+                n_unique,
+                *self._cpu_w2_scale.shape[1:],
+                dtype=self._cpu_w2_scale.dtype,
+                device=device,
+            )
+        else:
+            buf_w13_scale = None
+            buf_w2_scale = None
+
+        for i, expert_id in enumerate(unique_ids):
+            buf_w13[i].copy_(self._cpu_w13[expert_id])
+            buf_w2[i].copy_(self._cpu_w2[expert_id])
+            if buf_w13_scale is not None:
+                buf_w13_scale[i].copy_(self._cpu_w13_scale[expert_id])
+                buf_w2_scale[i].copy_(self._cpu_w2_scale[expert_id])
+
+        # Build a one-shot expert_id -> local slot lookup table on GPU.
+        lookup = torch.full(
+            (self._num_experts,), -1, dtype=torch.int64, device=device
+        )
+        for i, expert_id in enumerate(unique_ids):
+            lookup[expert_id] = i
+        remapped_ids = lookup[topk_ids.long()].to(dtype=topk_ids.dtype)
+
+        if not self._overflow_warned:
+            logger.warning(
+                "CachedWeightProvider.prepare(): unique experts (%d) > "
+                "capacity (%d). Falling back to per-forward overflow buffer "
+                "(correct but slower than LRU hits). Consider raising "
+                "moe-expert-cache-size to >= max-unique-experts-per-forward "
+                "for better throughput.",
+                n_unique, self.capacity,
+            )
+            self._overflow_warned = True
+        self.overflow_prepares = getattr(self, "overflow_prepares", 0) + 1
+
+        return ExpertWeightResult(
+            w1=buf_w13,
+            w2=buf_w2,
+            topk_ids=remapped_ids,
+            w1_scale=buf_w13_scale,
+            w2_scale=buf_w2_scale,
+        )
+
     @torch.compiler.disable
     def prepare(self, topk_ids: torch.Tensor) -> ExpertWeightResult:
         """Populate the GPU buffer and return slot-remapped expert IDs.
@@ -201,23 +285,14 @@ class CachedWeightProvider(ExpertWeightProvider):
         Returns:
             ExpertWeightResult with remapped topk_ids and GPU buffer refs.
 
-        Raises:
-            RuntimeError: If unique experts exceed capacity.
+        When unique experts in ``topk_ids`` exceed ``self.capacity``, we
+        fall back to a per-forward overflow buffer (see
+        :meth:`_prepare_overflow`).  This is correct regardless of cache
+        capacity, at the cost of not reusing CPU->GPU copies across calls.
         """
         unique_ids = topk_ids.unique().tolist()
         if len(unique_ids) > self.capacity:
-            # Prefill overflow: more unique experts than cache slots.
-            # Process only the last `capacity` experts (most likely to be
-            # needed in upcoming decode steps). Warn once.
-            if not self._overflow_warned:
-                logger.warning(
-                    "CachedWeightProvider.prepare() called with %d unique "
-                    "experts but capacity is only %d. Truncating to last %d. "
-                    "This is expected during prefill with large batches.",
-                    len(unique_ids), self.capacity, self.capacity,
-                )
-                self._overflow_warned = True
-            unique_ids = unique_ids[-self.capacity:]
+            return self._prepare_overflow(topk_ids, unique_ids)
 
         for expert_id in unique_ids:
             if expert_id in self._lru:
@@ -308,14 +383,10 @@ class LFRUCachedWeightProvider(CachedWeightProvider):
 
         unique_ids = topk_ids.unique().tolist()
         if len(unique_ids) > self.capacity:
-            if not self._overflow_warned:
-                logger.warning(
-                    "LFRUCachedWeightProvider.prepare() called with %d unique "
-                    "experts but capacity is only %d. Truncating to last %d.",
-                    len(unique_ids), self.capacity, self.capacity,
-                )
-                self._overflow_warned = True
-            unique_ids = unique_ids[-self.capacity:]
+            # Delegate to the base class overflow fallback (allocates a
+            # per-forward GPU buffer big enough for all unique experts).
+            # Correct regardless of cache size, at the cost of no reuse.
+            return self._prepare_overflow(topk_ids, unique_ids)
 
         for expert_id in unique_ids:
             # Update frequency (decayed)
