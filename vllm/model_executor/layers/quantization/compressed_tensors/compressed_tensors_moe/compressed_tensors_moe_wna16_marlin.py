@@ -904,8 +904,13 @@ class CompressedTensorsWNA16MarlinMoEMethod(CompressedTensorsMoEMethod):
                 )
         if provider is not None:
             # Expert LRU cache path: provider streams the requested experts
-            # from CPU pinned into a small GPU scratch, returns buffer refs
-            # and slot-remapped topk_ids.
+            # from CPU disk-backed storage into a GPU buffer and returns
+            # slot-remapped topk_ids. When unique_experts <= capacity the
+            # w1/w2 tensors come from the persistent LRU slots; on overflow
+            # they come from a one-shot per-forward buffer sized to
+            # len(unique_ids). global_num_experts MUST match the actual
+            # expert dimension of result.w1, NOT provider.capacity, or the
+            # Marlin kernel will overrun its bounds on the overflow path.
             result = provider.prepare(topk_ids)
             return fused_marlin_moe(
                 x,
@@ -921,7 +926,7 @@ class CompressedTensorsWNA16MarlinMoEMethod(CompressedTensorsMoEMethod):
                 input_global_scale2=None,
                 quant_type_id=self.quant_type.id,
                 apply_router_weight_on_input=layer.apply_router_weight_on_input,
-                global_num_experts=provider.capacity,
+                global_num_experts=result.w1.shape[0],
                 activation=layer.activation,
                 expert_map=None,
                 g_idx1=layer.w13_weight_g_idx,
